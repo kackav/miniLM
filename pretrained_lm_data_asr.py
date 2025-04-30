@@ -58,10 +58,11 @@ class AsrDataset(torch.utils.data.Dataset):
             audio = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)(audio)
         inp = text
         label = text
+        
         return {"audio" : audio,
                 "audio_len" : audio.shape[1],
                 "text_trans" : text,
-                "input_ids" : [self.tokenizer.eos_token_id] + self.tokenizer.encode(inp),
+                "input_ids" : self.tokenizer.encode(" ") + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
                 "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
                 "labels_len" : len(self.tokenizer.encode(label)) + 1
@@ -163,7 +164,7 @@ def load_from_transcript(trans_path, audio_dir):
             splt = line.split(maxsplit =  1)
             if len(splt)>1:
                 audio_path = os.path.join(audio_dir, splt[0] + ".flac")
-                trans = splt[1]
+                trans = splt[1].lower()
                 dict = {'track': f'{splt[0]}', 'text' : (trans, audio_path)}
                 data_dict.append(dict)
 

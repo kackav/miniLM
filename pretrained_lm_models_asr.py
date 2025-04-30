@@ -194,11 +194,11 @@ class WavLMWrapper(nn.Module):
     def forward(self,  x: Dict[str, torch.Tensor]):
         features = x['audio']
         speech_length = x['audio_len']
-
+        attention_mask = lengths_to_mask(speech_length).long()
+        
         for kernel_size, stride in zip(self.kernel_sizes, self.strides):
             speech_length = (1 + (speech_length - kernel_size) / stride).int()
 
-        attention_mask = lengths_to_mask(speech_length).long()
         features = self.encoder(features, attention_mask=attention_mask)
         features = features.last_hidden_state
 
@@ -228,7 +228,7 @@ class Connector(nn.Module):
                        'kernel_sizes': kernel_sizes,
                        'strides': strides
                        }
-        
+   
     def forward(self, x):
         features = x['encoder_output']
         speech_length = x['encoder_output_length']
