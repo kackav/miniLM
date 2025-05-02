@@ -254,7 +254,7 @@ class EncoderConnectorLm(nn.Module):
         self.encoder = encoder
         self.connector = connector
         self.lm = lm
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction = "sum")
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = tokenizer
         self.printing = True
         self.config = {'encoder': encoder.config,
