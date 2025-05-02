@@ -468,7 +468,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         text_mask = torch.ones(text_embedding.shape[0], text_embedding.shape[1], device=connector_output.device, dtype=torch.bool)
         full_mask = torch.cat((connector_mask, text_mask), dim=1)
 
-        lm_outputs = self.lm(inputs_embeds = full_embedding)
+        lm_outputs = self.lm(inputs_embeds = full_embedding, attention_mask=full_mask)
         logits = lm_outputs['logits']
         if self.printing:
             print(f'logits shape:{logits.shape}')
