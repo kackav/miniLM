@@ -163,7 +163,6 @@ def main():
     train_file = args.train_dir
     dset_train = data_asr.load_from_transcript(train_file, args.audio_dir)
     dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
-   # print(dset_train[0])
     trans_train = [{"text": _["text"][0]} for _ in dset_train]
     
     tokenizer = transformers.AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True)
@@ -181,11 +180,10 @@ def main():
                                                     num_workers=args.dataloader_num_workers)
     encoder = models_asr.WavLMWrapper()
     connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
-    connector = connector.to(torch.bfloat16)
     lm = transformers.AutoModelForCausalLM.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True,
                                                            torch_dtype=torch.bfloat16,
                                                            attn_implementation='flash_attention_2',
-                                                           device_map='auto')
+                                                           )
 
     #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
@@ -245,7 +243,7 @@ def main():
             x = batch
             y = batch['labels'].to(device)
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
-                z, loss, acc = model(x)
+                z, loss, acc = model(x, padding='left')
             # loss = criterion(z.permute(0, 2, 1), y)
             (loss/args.accumulation_steps).backward()
 
@@ -254,15 +252,19 @@ def main():
             # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
             training_acc += acc.mean().item()
             training_count += 1
-            
+
         writer.add_scalar("Loss/train", loss, j)
         writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
         writer.add_scalar("Accuracy/train", acc, j)
+        writer.add_scalar("Data/Audio Length", batch['audio_len'].float().mean().item(), j)
+        writer.add_scalar("Data/Text Length", batch['input_len'].float().mean().item(), j)
+        writer.add_scalar("Data/Batch Size", batch['audio'].shape[0], j)
 
 
         # clip gradients
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-        torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+        # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+        writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -283,14 +285,15 @@ def main():
                     val_y = val_batch['labels'].to(device)
                     #val_z = model(val_x)
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
-                        z, loss, acc = model(val_x)
+                        z, loss, acc = model(val_x, padding='left')
                     #loss = criterion(val_z.permute(0, 2, 1), val_y)
                     val_loss += (loss).mean().item()
                     #acc = ((val_z.argmax(dim=-1) == val_y) * (val_y >= 0)).sum() / (val_y >= 0).sum()
                     val_acc += acc.mean().item()
                     val_count += 1
 
-                    text_x = model.generate(val_x, 100)
+                    with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
+                        text_x = model.generate(val_x, 100, padding='left')
                     text_y = val_batch['text_trans']
                     all_transcriptions += text_x
                     all_references += text_y
