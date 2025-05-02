@@ -151,34 +151,32 @@ class Transformer(nn.Module):
 
     @classmethod
     def load_from_dir(cls, output_dir, device=None):
-        with open(os.path.join(output_dir, 'lm_config.yaml'), 'r') as f:
+        with open(os.path.join(output_dir, 'config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(**config)
-        model.load_state_dict(torch.load(os.path.join(output_dir, 'lm_model.pt'), weights_only=True, map_location=device))
+        model.load_state_dict(torch.load(os.path.join(output_dir, 'model.pt'), weights_only=True, map_location=device))
         return model
-
-    def generate_with_eos(self, x, max_len, eos_token, temperature=1.0):
-        self.eval()
-        x_still_active = torch.ones(x.shape[0], 1, device=x.device, dtype=torch.bool)
-        with torch.no_grad():
-            for _ in range(max_len):
-                z = self(x)
-                z = z[:, -1] / temperature
-                z = torch.multinomial(torch.softmax(z, dim=-1), 1)
-                z_to_concat = torch.where(x_still_active, z, torch.full_like(z, eos_token))
-                x = torch.cat([x, z_to_concat], dim=1)
-                x_still_active = x_still_active & (z != eos_token)
-                if not x_still_active.any():
-                    break
-        return x
 
 
 def lengths_to_mask(lengths: torch.Tensor):
-        if lengths is None:
-            return None
-        max_length = lengths.max()
-        mask = torch.arange(max_length)[None, :].to(lengths.device) < lengths[:, None]
-        return mask
+    if lengths is None:
+        return None
+    max_length = lengths.max()
+    mask = torch.arange(max_length)[None, :].to(lengths.device) < lengths[:, None]
+    return mask
+
+def lengths_to_left_padded_mask(lengths):
+    if lengths is None:
+        return None
+    max_length = lengths.max()
+    mask = torch.arange(max_length - 1, -1, -1)[None, :].to(lengths.device) < lengths[:, None]
+    return mask
+
+def shift_batch_right(input_tensor, lengths):
+    z = torch.zeros_like(input_tensor)
+    for i, (au, le) in enumerate(zip(input_tensor, lengths)):
+        z[i, -le:] = au[:le]
+    return z
 
 class WavLMWrapper(nn.Module): 
     def __init__(self, model_name="microsoft/wavlm-base-plus"):
@@ -207,7 +205,6 @@ class WavLMWrapper(nn.Module):
         return x
 
 
-
 class Connector(nn.Module):
     def __init__(self, dim_input, dim_output, num_heads, ff_size, num_connector_layers = 2, kernel_sizes = (7,7), strides = (3,2)):
         super(Connector, self).__init__()
@@ -224,9 +221,9 @@ class Connector(nn.Module):
                        'dim_output': dim_output,
                        'num_heads': num_heads,
                        'ff_size': ff_size,
-                       'num_encoder_layers': num_connector_layers,
-                       'kernel_sizes': kernel_sizes,
-                       'strides': strides
+                       'num_connector_layers': num_connector_layers,
+                       'kernel_sizes': list(kernel_sizes),
+                       'strides': list(strides)
                        }
    
     def forward(self, x):
@@ -256,6 +253,8 @@ class Connector(nn.Module):
     def load_from_dir(cls, output_dir, device=None):
         with open(os.path.join(output_dir, 'connector_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
+        if 'num_encoder_layers' in config:
+            config['num_connector_layers'] = config.pop('num_encoder_layers')
         model = cls(**config)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'connector_model.pt'), weights_only=True, map_location=device))
         return model
@@ -344,96 +343,6 @@ class EncoderConnectorLm(nn.Module):
         text_str = self.tokenizer.decode_batch(text.tolist())
         return text_str
 
-class EncoderConnectorLmWithPretrainedLm(nn.Module):
-    def __init__(self, encoder, connector, lm, tokenizer):
-        super(EncoderConnectorLmWithPretrainedLm, self).__init__()
-        self.encoder = encoder
-        self.connector = connector
-        self.lm = lm
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
-        self.tokenizer = tokenizer
-        self.printing = True
-        self.config = {'encoder': encoder.config,
-                'connector' : connector.config,
-                'lm' : lm.config}
-
-    def freeze_encoder(self):
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-    
-    def freeze_lm(self):
-        for param in self.lm.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        text, text_lengths = x['input_ids'], x['input_len']
-        labels, labels_lengths = x['labels'], x['labels_len']
-        if self.printing:
-            print(x['audio'].shape)
-            print(x['audio_len'])
-            print(x['input_ids'].shape)
-            print(x['input_len'])
-
-        x = self.encoder(x)
-        if self.printing:
-            print('encoder')
-            print(x['encoder_output'].shape)
-            print(x['encoder_output_length'])
-
-        x = self.connector(x)
-        if self.printing:
-            print('connector')
-            print(x['connector_output'].shape)
-            print(x['connector_output_length'])
-
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        
-        text_embedding = self.lm.get_input_embeddings()(text)
-        if self.printing:
-            print(f'text embedding shape:{text_embedding.shape}')
-        
-        full_embedding, full_lengths = concat_two_sequences(connector_output, text_embedding, connector_lengths, text_lengths)
-        if self.printing:
-            print('full embedding')
-            print(full_embedding.shape)
-            print(full_lengths)
-        
-        lm_outputs = self.lm(inputs_embeds = full_embedding)
-        logits = lm_outputs['logits']            
-        if self.printing:
-            print(f'logits shape:{logits.shape}')
-
-        x_logits, y_logits, x_ln, y_ln = separate_two_sequences(logits, full_lengths, connector_lengths)
-        loss = self.criterion(y_logits.transpose(1, -1), labels)
-        accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
-        self.printing = False
-        return y_logits, loss, accuracy
-
-    def generate(self, x, max_len): #100 maxlen
-        batch_size = x['audio'].shape[0]
-        x = self.encoder(x)
-        x = self.connector(x)
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        text = torch.ones(batch_size, 1, device = connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id
-        bos = self.tokenizer.eos_token_id
-        
-        gen_config = transformers.GenerationConfig(
-                bos_token_id=bos,
-                pad_token_id=self.tokenizer.pad_token_id,
-                decoder_start_token_id=bos,
-                decoder_end_token_id=self.tokenizer.eos_token_id,
-                length_penalty=1, #gen_args.length_penalty,
-                early_stopping=False, #gen_args.early_stopping,
-                eos_token_id=self.tokenizer.eos_token_id,
-                num_beams= 1,#gen_args.num_beams,
-                max_new_tokens= 100, #gen_args.max_new_tokens,
-            )
-        
-        self.lm.generation_config = gen_config
-        text = self.lm.generate(inputs_embeds = connector_output, attention_mask = lengths_to_mask(connector_lengths), do_sample=False)
-        
-        text_str = self.tokenizer.batch_decode(text.tolist(), skip_special_tokens=True)
-        return text_str
 
 def concat_two_sequences(x, y, x_lengths, y_lengths):
     lengths = x_lengths + y_lengths
