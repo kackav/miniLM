@@ -139,34 +139,27 @@ def main():
                         help='train lm')
     
 
-
     args = parser.parse_args()
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.output_dir
-    #torch.set_default_dtype(torch.bfloat16)
-    torch.set_float32_matmul_precision('high')
 
     for arg in vars(args):
         print(f'{arg}: {getattr(args, arg)}')
 
     safe_gpu.claim_gpus()
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
-    # dset = datasets.load_dataset(args.dataset, args.dataset_name)
-    # dset_train = dset[args.train_split]
-    # dset[args.valid_split]
-
-    # train on Librispeech dataset shuf.txt
-    ## dset_train, dset_valid = data_minimal.load_data()
-    writer = SummaryWriter(log_dir=args.log_dir)
-
+    torch.set_float32_matmul_precision('high')    
+    #torch.set_default_dtype(torch.bfloat16)
+    
+    ## prepare validation and training data
     val_file = args.val_dir
     train_file = args.train_dir
     dset_train = data_asr.load_from_transcript(train_file, args.audio_dir)
     dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
-   # print(dset_train[0])
+    ## tokenizer loaded from tokenizer_dir or trained from scratch (for miniLm, otherwise load Olmo tokenizer and then lower-case val and train data)
     trans_train = [{"text": _["text"][0]} for _ in dset_train]
-    
     tokenizer = data_asr.train_bpe(trans_train, args.bpe_vocab_size, output_dir = args.tokenizer_dir, num_sentences = args.bpe_num_sentences)
+    #tokenizer = transformers.AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True)
     train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir)
     validation_data = data_asr.AsrDataset(dset_valid, tokenizer, args.audio_dir)
 
@@ -179,17 +172,18 @@ def main():
     validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
                                                     collate_fn=collate_fn,
                                                     num_workers=args.dataloader_num_workers)
+    
+    ## load model and optimizer
     encoder = models_asr.WavLMWrapper()
     connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     connector = connector.to(torch.bfloat16)
-    lm = transformers.AutoModelForCausalLM.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True,
-                                                           torch_dtype=torch.bfloat16,
-                                                           attn_implementation='flash_attention_2',
-                                                           device_map='auto')
-
-    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    #lm = transformers.AutoModelForCausalLM.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True,
+    #                                                       torch_dtype=torch.bfloat16,
+    #                                                       attn_implementation='flash_attention_2',
+    #                                                       device_map='auto')
     
-    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer)
+    model = models_asr.EncoderConnectorLm(encoder, connector, lm, tokenizer)
     model = model.to(device)
 
     if not args.train_encoder:
@@ -202,18 +196,18 @@ def main():
         parameters_to_train += list(model.encoder.parameters())
     if args.train_lm:
         parameters_to_train += list(model.lm.parameters())
-    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
     
+    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+    lr_lambda_partial = functools.partial(lr_lambda, args=args)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
+
+    # CHECK THIS - MODEL.PARAMETERS = MODEL.ENCODER.PARAMETERS + MODEL.CONNECTOR.PARAMETERS + MODEL.LM.PARAMETERS ?
     print(model.config)
     print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
-    lr_lambda_partial = functools.partial(lr_lambda, args=args)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
-
-    train_loader_iter = iter(train_loader)
-
-    # Running variables for keeping track of training metrics
+    ## running variables for keeping track of training metrics
+    writer = SummaryWriter(log_dir=args.log_dir)
     train_loss = 0
     training_acc = 0
     training_count = 0
@@ -228,12 +222,14 @@ def main():
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
-#    with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+    
+    ## training loop
+    #with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+    train_loader_iter = iter(train_loader)
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
         
         for k in range(args.accumulation_steps):
-
             try:
                 batch = next(train_loader_iter)
             except StopIteration:
@@ -248,7 +244,6 @@ def main():
                 z, loss, acc = model(x)
             # loss = criterion(z.permute(0, 2, 1), y)
             (loss/args.accumulation_steps).backward()
-
             # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
             train_loss += loss.mean().item()
             # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
@@ -259,10 +254,9 @@ def main():
         writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
         writer.add_scalar("Accuracy/train", acc, j)
 
-
         # clip gradients
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-        torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+        #torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -289,8 +283,8 @@ def main():
                     #acc = ((val_z.argmax(dim=-1) == val_y) * (val_y >= 0)).sum() / (val_y >= 0).sum()
                     val_acc += acc.mean().item()
                     val_count += 1
-
-                    text_x = model.generate(val_x, 100)
+                    with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
+                        text_x = model.generate(val_x, 100)
                     text_y = val_batch['text_trans']
                     all_transcriptions += text_x
                     all_references += text_y
