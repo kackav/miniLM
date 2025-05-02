@@ -165,18 +165,6 @@ def lengths_to_mask(lengths: torch.Tensor):
     mask = torch.arange(max_length)[None, :].to(lengths.device) < lengths[:, None]
     return mask
 
-def lengths_to_left_padded_mask(lengths):
-    if lengths is None:
-        return None
-    max_length = lengths.max()
-    mask = torch.arange(max_length - 1, -1, -1)[None, :].to(lengths.device) < lengths[:, None]
-    return mask
-
-def shift_batch_right(input_tensor, lengths):
-    z = torch.zeros_like(input_tensor)
-    for i, (au, le) in enumerate(zip(input_tensor, lengths)):
-        z[i, -le:] = au[:le]
-    return z
 
 class WavLMWrapper(nn.Module): 
     def __init__(self, model_name="microsoft/wavlm-base-plus"):
@@ -258,6 +246,7 @@ class Connector(nn.Module):
         model = cls(**config)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'connector_model.pt'), weights_only=True, map_location=device))
         return model
+
 
 class EncoderConnectorLm(nn.Module):
     def __init__(self, encoder, connector, lm, tokenizer):
