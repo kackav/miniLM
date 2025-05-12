@@ -203,6 +203,9 @@ def main():
     optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
     
     print(model.config)
+    with open(os.path.join(args.output_dir, 'model_config.yaml'), 'w') as f:
+        yaml.dump(model.config, f)
+    
     print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
@@ -229,7 +232,9 @@ def main():
 #    with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
-        
+        model.connector.train()
+        model.encoder.eval()
+        model.lm.eval()
         for k in range(args.accumulation_steps):
 
             try:
@@ -338,12 +343,14 @@ def main():
                 }
             all_metrics.append(logging_dict)
             print(logging_dict)
-            model.train()
+            #model.train()
             train_loss = 0
             training_acc = 0
             training_count = 0
 
             model.connector.save_to_directory(os.path.join(args.output_dir, 'latest'))
+            if args.train_encoder:
+                model.encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
             # save otpimizer state
             torch.save(optimizer.state_dict(), os.path.join(args.output_dir, 'latest', 'optimizer.pt'))
             # save scheduler state
@@ -353,6 +360,8 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model.connector.save_to_directory(os.path.join(args.output_dir, 'best'))
+                if args.train_encoder:
+                    model.encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
             recent_val_loss = [m['val_loss'] for m in all_metrics[-args.early_stopping_patience:]]
             all_val_losses = [m['val_loss'] for m in all_metrics]
@@ -362,6 +371,8 @@ def main():
 
         if j % args.save_steps == 0:
             model.connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
+            if args.train_encoder:
+                model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
     
         writer.flush()

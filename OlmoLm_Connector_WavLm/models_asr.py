@@ -222,6 +222,19 @@ class WavLMWrapper(nn.Module):
         x['encoder_output_length'] = speech_length
         return x
 
+    def save_to_directory(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'w') as f:
+            yaml.dump(self.config, f)
+        torch.save(self.state_dict(), os.path.join(output_dir, 'encoder_model.pt'))
+    
+    @classmethod
+    def load_from_dir(cls, output_dir, device=None):
+        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        model = cls(**config)
+        model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
+        return model
 
 
 class Connector(nn.Module):
@@ -277,90 +290,6 @@ class Connector(nn.Module):
         model = cls(**config)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'connector_model.pt'), weights_only=True, map_location=device))
         return model
-
-class EncoderConnectorLm(nn.Module):
-    def __init__(self, encoder, connector, lm, tokenizer):
-        super(EncoderConnectorLm, self).__init__()
-        self.encoder = encoder
-        self.connector = connector
-        self.lm = lm
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction = "sum")
-        self.tokenizer = tokenizer
-        self.printing = True
-        self.config = {'encoder': encoder.config,
-                       'connector' : connector.config,
-                       'lm' : lm.config}
-    def freeze_encoder(self):
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-    
-    def freeze_lm(self):
-        for param in self.lm.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        text, text_lengths = x['input_ids'], x['input_len']
-        labels, labels_lengths = x['labels'], x['labels_len']
-        if self.printing:
-            print(x['audio'].shape)
-            print(x['audio_len'])
-            print(x['input_ids'].shape)
-            print(x['input_len'])
-
-        x = self.encoder(x)
-
-        if self.printing:
-            print(x['encoder_output'].shape)
-            print(x['encoder_output_length'])
-
-        x = self.connector(x)
-        if self.printing:
-            print(x['connector_output'].shape)
-            print(x['connector_output_length'])
-
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        text_embedding = self.lm.embedding(text)
-        text_embedding = self.lm.positional_embedding(text_embedding)
-        full_embedding, full_lengths = concat_two_sequences(connector_output, text_embedding, connector_lengths, text_lengths)
-        if self.printing:
-            print(full_embedding.shape)
-            print(full_lengths)
-        logits = self.lm(
-            full_embedding,
-            input_is_embeddings=True,
-            )
-        x_logits, y_logits, x_ln, y_ln = separate_two_sequences(logits, full_lengths, connector_lengths)
-        loss = self.criterion(y_logits.transpose(1, -1), labels)
-        accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
-        self.printing = False
-        return y_logits, loss, accuracy
-
-    def generate(self, x, max_len): #100 maxlen
-        batch_size = x['audio'].shape[0]
-        x = self.encoder(x)
-        x = self.connector(x)
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        text = torch.ones(batch_size, 1, device = connector_output.device, dtype=torch.long) * self.tokenizer.token_to_id("[BOS]")
-        eos_token = self.tokenizer.token_to_id("[EOS]")
-        x_still_active = torch.ones(batch_size, device=x['audio'].device, dtype=torch.bool)
-        for i in range(max_len):
-            text_lengths = text.shape[1] * torch.ones(batch_size, device = connector_output.device, dtype=torch.long)
-            text_embedding = self.lm.embedding(text)
-            text_embedding = self.lm.positional_embedding(text_embedding)
-            full_embedding, full_lengths = concat_two_sequences(connector_output, text_embedding, connector_lengths, text_lengths)
-            logits = self.lm(
-                full_embedding,
-                input_is_embeddings=True,
-                )
-            x_logits, y_logits, x_ln, y_ln = separate_two_sequences(logits, full_lengths, connector_lengths)
-            z = y_logits[:, -1].argmax(dim=-1)
-            z_to_concat = torch.where(x_still_active, z, torch.full_like(z, eos_token))
-            text = torch.cat([text, z_to_concat.unsqueeze(1)], dim=1)
-            x_still_active = x_still_active & (z != eos_token)
-            if not x_still_active.any():
-                break
-        text_str = self.tokenizer.decode_batch(text.tolist())
-        return text_str
 
 class EncoderConnectorLmWithPretrainedLm(nn.Module):
     def __init__(self, encoder, connector, lm, tokenizer):
@@ -492,13 +421,13 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         x = self.encoder(x)
         x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        bos = self.tokenizer.encode(" ")[0]
-        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * bos
+        #bos = self.tokenizer.encode(" ")[0]
+        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id
         
         gen_config = transformers.GenerationConfig(
-                bos_token_id=bos,
+                bos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
-                decoder_start_token_id=bos,
+                decoder_start_token_id=self.tokenizer.eos_token_id,
                 decoder_end_token_id=self.tokenizer.eos_token_id,
                 length_penalty=1,
                 early_stopping=False,
@@ -520,13 +449,13 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         x = self.encoder(x)
         x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        bos = self.tokenizer.encode(" ")[0]  # self.tokenizer.eos_token_id
-        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * bos
+        #bos = self.tokenizer.encode(" ")[0]  # self.tokenizer.eos_token_id
+        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id
 
         gen_config = transformers.GenerationConfig(
-            bos_token_id=bos,
+            bos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
-            decoder_start_token_id=bos,
+            decoder_start_token_id=self.tokenizer.eos_token_id,
             decoder_end_token_id=self.tokenizer.eos_token_id,
             length_penalty=1,  # gen_args.length_penalty,
             early_stopping=False,  # gen_args.early_stopping,
