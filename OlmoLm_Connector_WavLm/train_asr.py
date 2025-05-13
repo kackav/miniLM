@@ -223,16 +223,23 @@ def main():
     training_count = 0
     best_val_loss = float('inf')
     all_metrics = []
-
     if args.resume:
-        print('Resuming from checkpoint')
-        model.connector = model.connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
-        scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
-        with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
-            all_metrics = yaml.safe_load(f)
-        best_val_loss = min([m['val_loss'] for m in all_metrics])
-#    with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+            print('Resuming from checkpoint')
+            print(device)
+        
+            model.connector = model.connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+            model.connector = model.connector.to(torch.bfloat16)
+            model.connector = model.connector.to(device)
+            if args.train_encoder:
+                model.encoder = model.encoder.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+                model.encoder = model.encoder.to(torch.bfloat16)
+                model.encoder = model.encoder.to(device)
+            optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
+            scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
+            with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
+                all_metrics = yaml.safe_load(f)
+            best_val_loss = min([m['val_loss'] for m in all_metrics])
+       #with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
         model.connector.train()
