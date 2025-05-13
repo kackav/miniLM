@@ -197,8 +197,9 @@ def shift_batch_right(input_tensor, lengths):
 
 
 class WavLMWrapper(nn.Module): 
-    def __init__(self, model_name="microsoft/wavlm-base-plus"):
+    def __init__(self, model_name="microsoft/wavlm-large"):
         super().__init__()
+        print(model_name)
         self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         self.encoder.config.mask_feature_prob = 0.0
         self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
@@ -300,9 +301,9 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = tokenizer
         self.printing = True
-        self.config = {'encoder': encoder.config,
-                'connector' : connector.config,
-                'lm' : lm.config}
+        self.config = {'encoder': [encoder.config],
+                'connector' : [connector.config],
+                'lm' : [lm.config]}
 
     def freeze_encoder(self):
         for param in self.encoder.parameters():
@@ -372,7 +373,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
             print(x['audio_len'])
             print(x['input_ids'].shape)
             print(x['input_len'])
-
+        
         x = self.encoder(x)
         if self.printing:
             print('encoder')
@@ -446,8 +447,10 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
 
     def left_padded_generate(self, x, max_len):  # 100 maxlen
         batch_size = x['audio'].shape[0]
-        x = self.encoder(x)
-        x = self.connector(x)
+        with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
+            
+            x = self.encoder(x)
+            x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
         #bos = self.tokenizer.encode(" ")[0]  # self.tokenizer.eos_token_id
         text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id

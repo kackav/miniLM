@@ -62,7 +62,7 @@ class AsrDataset(torch.utils.data.Dataset):
         return {"audio" : audio,
                 "audio_len" : audio.shape[1],
                 "text_trans" : text,
-                "input_ids" : self.tokenizer.encode(" ") + self.tokenizer.encode(inp),
+                "input_ids" : [self.tokenizer.eos_token_id] + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
                 "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
                 "labels_len" : len(self.tokenizer.encode(label)) + 1
