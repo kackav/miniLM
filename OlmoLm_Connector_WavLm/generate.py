@@ -321,8 +321,6 @@ def main():
                 writer.add_text('WER', to_write, j)
 
                 #([tokenizer.decode(x['input_ids'].tolist()) for x in val_batch], [tokenizer.decode(x['labels'].tolist()) for x in val_batch])
-                train_loss = train_loss / training_count
-                training_acc = training_acc / training_count
                 val_loss = val_loss / val_count
                 writer.add_scalar("Loss/validation", val_loss, j)
                 val_acc = val_acc / val_count
