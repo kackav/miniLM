@@ -362,7 +362,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         if bos_token is None:
             bos_token = self.tokenizer.eos_token_id
         else:
-            bos_token = self.tokenizer.token_to_id(bos_token)[0]
+            bos_token = self.tokenizer.encode(bos_token)[0]
         x = self.encoder(x)
         x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']

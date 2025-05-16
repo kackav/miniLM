@@ -47,7 +47,7 @@ class AsrDataset(torch.utils.data.Dataset):
         if bos_token is None:
             self.bos = [self.tokenizer.eos_token_id]
         else:
-            self.bos = self.tokenizer.encode(bos_token)[0]
+            self.bos = self.tokenizer.encode(bos_token)
 
     def __len__(self):
         return len(self.data)
