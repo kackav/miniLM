@@ -5,7 +5,6 @@ import yaml
 
 from typing import Dict
 import transformers
-import data_asr
 
 try:
     import flash_attn
@@ -199,15 +198,16 @@ def shift_batch_right(input_tensor, lengths):
 class WavLMWrapper(nn.Module): 
     def __init__(self, model_name="microsoft/wavlm-large"):
         super().__init__()
-        print(model_name)
         self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         self.encoder.config.mask_feature_prob = 0.0
         self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
         self.kernel_sizes = [_.conv.kernel_size[0] for _ in self.encoder.feature_extractor.conv_layers]
-        self.config = {'strides': self.strides,
-                'kernel_sizes': self.kernel_sizes
-                }
-
+        self.config = {
+            'model_name': model_name,
+            # 'strides': self.strides,
+            # 'kernel_sizes': self.kernel_sizes,
+            }
+        
     def forward(self,  x: Dict[str, torch.Tensor]):
         features = x['audio']
         speech_length = x['audio_len']
@@ -286,8 +286,8 @@ class Connector(nn.Module):
     def load_from_dir(cls, output_dir, device=None):
         with open(os.path.join(output_dir, 'connector_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-        if 'num_encoder_layers' in config:
-            config['num_connector_layers'] = config.pop('num_encoder_layers')
+        # if 'num_encoder_layers' in config:
+        #     config['num_connector_layers'] = config.pop('num_encoder_layers')
         model = cls(**config)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'connector_model.pt'), weights_only=True, map_location=device))
         return model
@@ -300,10 +300,10 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         self.lm = lm
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = tokenizer
-        self.printing = True
+        self.printing = False
         self.config = {'encoder': [encoder.config],
                 'connector' : [connector.config],
-                'lm' : [lm.config]}
+                'lm' : [lm.config.__dict__],}
 
     def freeze_encoder(self):
         for param in self.encoder.parameters():
@@ -313,59 +313,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         for param in self.lm.parameters():
             param.requires_grad = False
 
-    def forward(self, x, padding = 'right'):
-        if padding == 'left':
-            return self.left_padded_forward(x)
-        elif padding == 'right':
-            return self.right_padded_forward(x)
-        else:
-            raise ValueError(f"Unknown padding type: {padding}")
-
-    def right_padded_forward(self, x):
-        text, text_lengths = x['input_ids'], x['input_len']
-        labels, labels_lengths = x['labels'], x['labels_len']
-        if self.printing:
-            print(x['audio'].shape)
-            print(x['audio_len'])
-            print(x['input_ids'].shape)
-            print(x['input_len'])
-
-        x = self.encoder(x)
-        if self.printing:
-            print('encoder')
-            print(x['encoder_output'].shape)
-            print(x['encoder_output_length'])
-
-        x = self.connector(x)
-        if self.printing:
-            print('connector')
-            print(x['connector_output'].shape)
-            print(x['connector_output_length'])
-
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        
-        text_embedding = self.lm.get_input_embeddings()(text)
-        if self.printing:
-            print(f'text embedding shape:{text_embedding.shape}')
-        
-        full_embedding, full_lengths = concat_two_sequences(connector_output, text_embedding, connector_lengths, text_lengths)
-        if self.printing:
-            print('full embedding')
-            print(full_embedding.shape)
-            print(full_lengths)
-        
-        lm_outputs = self.lm(inputs_embeds = full_embedding)
-        logits = lm_outputs['logits']            
-        if self.printing:
-            print(f'logits shape:{logits.shape}')
-
-        x_logits, y_logits, x_ln, y_ln = separate_two_sequences(logits, full_lengths, connector_lengths)
-        loss = self.criterion(y_logits.transpose(1, -1), labels)
-        accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
-        self.printing = False
-        return y_logits, loss, accuracy
-
-    def left_padded_forward(self, x):
+    def forward(self, x):
         text, text_lengths = x['input_ids'], x['input_len']
         labels, labels_lengths = x['labels'], x['labels_len']
         if self.printing:
@@ -409,56 +357,21 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         self.printing = False
         return y_logits, loss, accuracy
 
-    def generate(self, x, max_len, padding = 'right'):
-        if padding == 'left':
-            return self.left_padded_generate(x, max_len)
-        elif padding == 'right':
-            return self.right_padded_generate(x, max_len)
-        else:
-            raise ValueError(f"Unknown padding type: {padding}")
-
-    def right_padded_generate(self, x, max_len): #100 maxlen
+    def generate(self, x, max_len, bos_token):  # 100 maxlen
         batch_size = x['audio'].shape[0]
+        if bos_token is None:
+            bos_token = self.tokenizer.eos_token_id
+        else:
+            bos_token = self.tokenizer.encode(bos_token)[0]
         x = self.encoder(x)
         x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        #bos = self.tokenizer.encode(" ")[0]
-        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id
-        
-        gen_config = transformers.GenerationConfig(
-                bos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-                decoder_start_token_id=self.tokenizer.eos_token_id,
-                decoder_end_token_id=self.tokenizer.eos_token_id,
-                length_penalty=1,
-                early_stopping=False,
-                eos_token_id=self.tokenizer.eos_token_id,
-                num_beams= 1,
-                max_new_tokens=max_len,
-            )
-        
-        self.lm.generation_config = gen_config
-        text_embedding = self.lm.get_input_embeddings()(text)
-        full_embedding, full_lengths = concat_two_sequences(connector_output, text_embedding, connector_lengths, text.shape[1]*torch.ones(batch_size, device = connector_output.device, dtype=torch.long))
-        text = self.lm.generate(inputs_embeds = full_embedding, attention_mask = lengths_to_mask(connector_lengths + 1), do_sample=False)
-        
-        text_str = self.tokenizer.batch_decode(text.tolist(), skip_special_tokens=True)
-        return text_str
-
-    def left_padded_generate(self, x, max_len):  # 100 maxlen
-        batch_size = x['audio'].shape[0]
-        with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
-            
-            x = self.encoder(x)
-            x = self.connector(x)
-        connector_output, connector_lengths = x['connector_output'], x['connector_output_length']
-        #bos = self.tokenizer.encode(" ")[0]  # self.tokenizer.eos_token_id
-        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * self.tokenizer.eos_token_id
+        text = torch.ones(batch_size, 1, device=connector_output.device, dtype=torch.long) * bos_token
 
         gen_config = transformers.GenerationConfig(
-            bos_token_id=self.tokenizer.eos_token_id,
+            bos_token_id=bos_token, #self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
-            decoder_start_token_id=self.tokenizer.eos_token_id,
+            decoder_start_token_id=bos_token, #self.tokenizer.eos_token_id,
             decoder_end_token_id=self.tokenizer.eos_token_id,
             length_penalty=1,  # gen_args.length_penalty,
             early_stopping=False,  # gen_args.early_stopping,
