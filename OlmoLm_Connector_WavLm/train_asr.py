@@ -143,11 +143,11 @@ def main():
     parser.add_argument('--train_lm', action='store_true',
                         help='train lm')
     
-    parser.add_argument('--encoder_eval', type='store_true',
+    parser.add_argument('--encoder_eval', action='store_true',
                         help='eval mode for encoder during training, if False train mode')
-    parser.add_argument('--connector_eval', type='store_true',
+    parser.add_argument('--connector_eval', action='store_true',
                         help='eval mode for connector during training, if False train mode')
-    parser.add_argument('--lm_eval', type='store_true',
+    parser.add_argument('--lm_eval', action='store_true',
                         help='eval mode for lm during training, if False train mode')
 
     args = parser.parse_args()
@@ -271,7 +271,7 @@ def main():
                     batch[key] = batch[key].to(device)
             x = batch
             y = batch['labels'].to(device)
-            
+
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
                 z, loss, acc = model(x)
 
