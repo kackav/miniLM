@@ -150,7 +150,8 @@ def main():
     for arg in vars(args):
         print(f'{arg}: {getattr(args, arg)}')
 
-    safe_gpu.claim_gpus()
+    print(torch.cuda.is_available())
+    #safe_gpu.claim_gpus()
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     # dset = datasets.load_dataset(args.dataset, args.dataset_name)
     # dset_train = dset[args.train_split]
@@ -269,7 +270,7 @@ def main():
                 # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
                 training_acc += acc.mean().item()
                 training_count += 1
-
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -319,7 +320,7 @@ def main():
                 '|------------|---------------|\n'] + to_write
                 to_write = ''.join(to_write)
                 writer.add_text('WER', to_write, j)
-
+                print(to_write)
                 #([tokenizer.decode(x['input_ids'].tolist()) for x in val_batch], [tokenizer.decode(x['labels'].tolist()) for x in val_batch])
                 val_loss = val_loss / val_count
                 writer.add_scalar("Loss/validation", val_loss, j)
