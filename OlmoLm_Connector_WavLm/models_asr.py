@@ -376,7 +376,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
             length_penalty=1,  # gen_args.length_penalty,
             early_stopping=False,  # gen_args.early_stopping,
             eos_token_id=self.tokenizer.eos_token_id,
-            num_beams=1,  # gen_args.num_beams,
+            num_beams=2,  # gen_args.num_beams,
             max_new_tokens=max_len,  # gen_args.max_new_tokens,
         )
 

@@ -13,6 +13,7 @@ from safe_gpu import safe_gpu
 import jiwer
 from torch.utils.tensorboard import SummaryWriter
 import transformers
+from whisper_normalizer.english import EnglishSpellingNormalizer
 
 def lr_lambda_linear_with_min_lr(step, args):
     peak_lr = args.peak_lr
@@ -120,6 +121,8 @@ def main():
                         help='output directory to save model checkpoints and generated outputs')
     parser.add_argument('--resume', action='store_true',
                         help='resume training from latest')
+    parser.add_argument('--generate', action='store_true',
+                        help='generate from latest')
     
     parser.add_argument('--train_dir', type=str, default=None,
                         help='train dataset dir')
@@ -173,29 +176,12 @@ def main():
     
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
     train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir, args.bos_token)
-    validation_data = data_asr.AsrDataset(dset_valid, tokenizer, args.audio_dir, args.bos_token)
 
-    collate_fn = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.per_device_train_batch_size,
-                                               collate_fn=collate_fn,
-                                               shuffle=True,
-                                               num_workers=args.dataloader_num_workers,
-    )
-                                          #     drop_last=True)
-                                        
-    validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
-                                                    collate_fn=collate_fn,
-                                                    num_workers=args.dataloader_num_workers)
     encoder = models_asr.WavLMWrapper(args.encoder_model_name)
     connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     connector = connector.to(torch.bfloat16)
-    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True,
-                                                           torch_dtype=torch.bfloat16,
-                                                           attn_implementation='flash_attention_2',
-                                                              device_map='auto',
-                                                           )
-
-    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
+   #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
     model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer)
     model = model.to(device)
@@ -220,14 +206,15 @@ def main():
     lr_lambda_partial = functools.partial(lr_lambda, args=args)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
 
-    train_loader_iter = iter(train_loader)
-
     # Running variables for keeping track of training metrics
     train_loss = 0
     training_acc = 0
     training_count = 0
     best_val_loss = float('inf')
     all_metrics = []
+
+    bos_token = args.bos_token
+    lm_model_name = args.lm_model_name
 
     if args.resume:
         print('Resuming from checkpoint')
@@ -240,10 +227,36 @@ def main():
             model.encoder = model.encoder.to(device)
         optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
         scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
+        if os.path.isfile(os.path.join(args.output_dir, 'lm_config.yaml')):
+            with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'r') as f:
+                lm_config = yaml.load(f, Loader=yaml.FullLoader)
+            lm_model_name = lm_config['model_name']
+            bos_token = lm_config['bos_token']
+        else:
+            lm_model_name = args.lm_model_name
+            bos_token = args.bos_token
+        
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
 
+    model.lm = transformers.AutoModelForCausalLM.from_pretrained(lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
+    tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
+    train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir, bos_token)
+    validation_data = data_asr.AsrDataset(dset_valid, tokenizer, args.audio_dir, bos_token)
+
+    collate_fn = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.per_device_train_batch_size,
+                                               collate_fn=collate_fn,
+                                               shuffle=True,
+                                               num_workers=args.dataloader_num_workers)
+                                          #     drop_last=True)
+                                        
+    validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
+                                                    collate_fn=collate_fn,
+                                                    num_workers=args.dataloader_num_workers)
+    train_loader_iter = iter(train_loader)  
+    normalizer = EnglishSpellingNormalizer()
     #with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
@@ -259,8 +272,10 @@ def main():
             model.lm.eval()
         else:
             model.lm.train()
-
         for k in range(args.accumulation_steps):
+            if args.generate:
+                break
+
             try:
                 batch = next(train_loader_iter)
             except StopIteration:
@@ -283,20 +298,22 @@ def main():
             training_acc += acc.mean().item()
             training_count += 1
 
-        writer.add_scalar("Loss/train", loss, j)
-        writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
-        writer.add_scalar("Accuracy/train", acc, j)
-        writer.add_scalar("Data/Audio Length", batch['audio_len'].float().mean().item(), j)
-        writer.add_scalar("Data/Text Length", batch['input_len'].float().mean().item(), j)
-        writer.add_scalar("Data/Batch Size", batch['audio'].shape[0], j)
+        if not(args.generate):
+            writer.add_scalar("Loss/train", loss, j)
+            writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
+            writer.add_scalar("Accuracy/train", acc, j)
+            writer.add_scalar("Data/Audio Length", batch['audio_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Text Length", batch['input_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Batch Size", batch['audio'].shape[0], j)
 
-        # clip gradients
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-        # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
-        writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+            # clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+            # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+            writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
         if j > 0 and j % args.validation_steps == 0:
             model.eval()
             with torch.no_grad():
@@ -322,8 +339,8 @@ def main():
                     val_count += 1
 
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                        text_x = model.generate(val_x, 100, bos_token = args.bos_token)
-                    text_y = val_batch['text_trans']
+                        text_x = [normalizer(text_str) for text_str in model.generate(val_x, 100, bos_token = bos_token)]
+                    text_y = [normalizer(text_str) for text_str in val_batch['text_trans']]
                     all_transcriptions += text_x
                     all_references += text_y
 
@@ -333,7 +350,8 @@ def main():
                 substitutions = output_wer.substitutions
                 wer = output_wer.wer
                 cer = jiwer.cer(all_references, all_transcriptions)
-
+                print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
+            
             full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
             #full_trt = sorted(full_trt, key=lambda x: x[0])
             to_write = full_trt[:50]
@@ -343,18 +361,32 @@ def main():
             '|------------|---------------|\n'] + to_write
             to_write = ''.join(to_write)
             writer.add_text('WER', to_write, j)
+            #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
+            if args.generate:
+
+                val_loss = val_loss / val_count
+                writer.add_scalar("Loss/validation", val_loss, j)
+                val_acc = val_acc / val_count
+                writer.add_scalar("Accuracy/validation", val_acc, j)
+                writer.add_scalar("WER/wer", wer, j)
+                writer.add_scalar("WER/insertions", insertions, j)
+                writer.add_scalar("WER/deletions", deletions, j)
+                writer.add_scalar("WER/substitutions", substitutions, j)
+                writer.add_scalar("WER/cer", cer, j)
+                logging_dict = {
+                'step': j,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'wer' : wer,
+                }
+                print(logging_dict)
+                yaml.dump(logging_dict, open(os.path.join(args.output_dir, 'latest', 'val_metrics.yaml'), 'w'))
+                writer.flush()
+                os._exit(0)
 
             train_loss = train_loss / training_count
             training_acc = training_acc / training_count
-            val_loss = val_loss / val_count
-            writer.add_scalar("Loss/validation", val_loss, j)
-            val_acc = val_acc / val_count
-            writer.add_scalar("Accuracy/validation", val_acc, j)
-            writer.add_scalar("WER/wer", wer, j)
-            writer.add_scalar("WER/insertions", insertions, j)
-            writer.add_scalar("WER/deletions", deletions, j)
-            writer.add_scalar("WER/substitutions", substitutions, j)
-            writer.add_scalar("WER/cer", cer, j)
+            
             logging_dict = {
                 'step': j,
                 'train_loss': train_loss,
@@ -373,12 +405,21 @@ def main():
             model.connector.save_to_directory(os.path.join(args.output_dir, 'latest'))
             if args.train_encoder:
                 model.encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
+            lm_config = {'model_name' : lm_model_name,
+                 'bos_token' : bos_token,
+            }
+            with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w') as f:
+                yaml.dump(lm_config, f)
+    
+            yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
+
+
             # save otpimizer state
             torch.save(optimizer.state_dict(), os.path.join(args.output_dir, 'latest', 'optimizer.pt'))
             # save scheduler state
             torch.save(scheduler.state_dict(), os.path.join(args.output_dir, 'latest', 'scheduler.pt'))
-            yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
-            yaml.dump(model.config, open(os.path.join(args.output_dir, 'latest', 'config.yaml'), 'w'))
+
+           # yaml.dump(model.config, open(os.path.join(args.output_dir, 'latest', 'config.yaml'), 'w'))
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss

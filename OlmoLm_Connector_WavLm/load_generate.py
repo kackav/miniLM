@@ -88,7 +88,7 @@ parser.add_argument('--max_grad_value', type=float, default=5.0,
                     help='maximum absolute gradient value for gradient clipping')
 parser.add_argument('--decode_checkpoint', type=str, default='best',
                     help='checkpoint to use for decoding')
-parser.add_argument('--output_dir', type=str, default='/mnt/matylda6/ivendrame/wavlm_connector_lm/experiments/pretrained_lm/wavlmBase_EncConnTrain_eval/outputs',
+parser.add_argument('--output_dir', type=str, default='/mnt/matylda6/ivendrame/wavlm_connector_lm/experiments/pretrained_lm/wavlmLarge_WDecay0_eos_eval/outputs',
                     help='output directory to save model checkpoints and generated outputs')
 parser.add_argument('--resume', action='store_true',
                     help='resume training from latest')
@@ -97,8 +97,8 @@ parser.add_argument('--train_dir', type=str, default="/mnt/matylda6/ivendrame/da
                     help='train dataset dir')
 parser.add_argument('--val_dir', type=str, default="/mnt/matylda6/ivendrame/data/librispeech_asr_data_dev_test/all_dev.txt",
                     help='val dataset dir')
-parser.add_argument('--log_dir', type=str, default="/mnt/matylda6/ivendrame/wavlm_connector_lm/tensorboard/connector_runs/generate_EncConnector_wavlmBase" ,
-                    help='log runs dir')
+parser.add_argument('--log_dir', type=str, default="/mnt/matylda6/ivendrame/wavlm_connector_lm/tensorboard/connector_runs/generate_wavlmLarge_WDecay0" ,
+                    help='log runs dir (for tensorboard)')
 parser.add_argument('--audio_dir', type=str, default="/mnt/matylda6/ivendrame/data/librispeech_asr_data_all_flacs",
                     help='audio dataset dir')
 parser.add_argument('--tokenizer_dir', type=str, default="/mnt/matylda6/ivendrame/wavlm_connector_lm/tokenizer",
