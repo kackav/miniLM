@@ -99,9 +99,21 @@ class PositionalEmbedding(nn.Module):
         self.embedding = nn.Parameter(torch.randn(max_len, hidden_size))
 
     def forward(self, x):
+        return x + self.embedding[:x.shape[1]].unsqueeqze(0)
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, hidden_size, max_len):
+        super(SinusoidalPositionalEmbedding, self).__init__()
+        embedding = torch.zeros(max_len, hidden_size)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, hidden_size, 2) * -(torch.log(torch.tensor(10000.0)) / hidden_size))
+        embedding[:, 0::2] = torch.sin(position * div_term)
+        embedding[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('embedding', embedding)
+
+    def forward(self, x):
         return x + self.embedding[:x.shape[1]].unsqueeze(0)
-
-
+    
 class Transformer(nn.Module):
     def __init__(self,
                  num_embeddings,
@@ -118,7 +130,7 @@ class Transformer(nn.Module):
         self.embedding = nn.Embedding(
             num_embeddings, hidden_size, padding_idx=None if tokenizer is None else tokenizer.token_to_id('[PAD]')
         )
-        self.positional_embedding = PositionalEmbedding(hidden_size, max_len)
+        self.positional_embedding = SinusoidalPositionalEmbedding(hidden_size, max_len)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(hidden_size, num_heads, ff_size, dropout, causal=causal)
                                      for _ in range(num_layers)])
         self.output = nn.Linear(hidden_size, num_embeddings)
@@ -246,6 +258,7 @@ class Connector(nn.Module):
                                   for kernel, stride in zip(kernel_sizes, strides)])
         self.strides = strides
         self.kernel_sizes = kernel_sizes
+        self.positional_embedding = PositionalEmbedding(dim_input, max_len=512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout = 0, causal=False)
                                      for _ in range(num_connector_layers)])
         
@@ -262,12 +275,14 @@ class Connector(nn.Module):
     def forward(self, x):
         features = x['encoder_output']
         speech_length = x['encoder_output_length']
+        features = nn.functional.gelu(features)
         for i, (kernel_size, stride) in enumerate(zip(self.kernel_sizes, self.strides)):
             features = features.transpose(1, 2)
             features = self.cnn[i](features)
             features = features.transpose(1, 2)
+            features = nn.functional.gelu(features)
             speech_length = (1 + (speech_length - kernel_size) / stride).int()
-    
+        features = self.positional_embedding(features)
         features = features[:, :speech_length.max().item(), :]
         for block in self.blocks:
             features = block(features)

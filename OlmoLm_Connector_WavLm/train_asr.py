@@ -386,7 +386,15 @@ def main():
 
             train_loss = train_loss / training_count
             training_acc = training_acc / training_count
-            
+            val_loss = val_loss / val_count
+            writer.add_scalar("Loss/validation", val_loss, j)
+            val_acc = val_acc / val_count
+            writer.add_scalar("Accuracy/validation", val_acc, j)
+            writer.add_scalar("WER/wer", wer, j)
+            writer.add_scalar("WER/insertions", insertions, j)
+            writer.add_scalar("WER/deletions", deletions, j)
+            writer.add_scalar("WER/substitutions", substitutions, j)
+            writer.add_scalar("WER/cer", cer, j)
             logging_dict = {
                 'step': j,
                 'train_loss': train_loss,
