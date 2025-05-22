@@ -309,6 +309,9 @@ def main():
             for key, value in batch_s.items():
                 if isinstance(value, torch.Tensor):
                     batch_s[key] = batch_s[key].to(device)
+            for key, value in batch_t.items():
+                if isinstance(value, torch.Tensor):
+                    batch_t[key] = batch_t[key].to(device)
             x_s = batch_s
             y_s = batch_s['labels'].to(device)
             x_t = batch_t
