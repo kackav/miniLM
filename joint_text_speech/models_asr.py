@@ -161,7 +161,7 @@ class TextEncoder(nn.Module):
         text_length = x['input_len']
         features = self.positional_embedding(features)
 
-        mask = torch.rand(features.shape[0], features.shape[1], device=x.device)
+        mask = torch.rand(features.shape[0], features.shape[1], device=features.device)
         features = torch.where(mask>self.mask_rate, features, torch.zeros_like(features))
         for block in self.blocks:
             features = block(features)
@@ -269,7 +269,7 @@ class Connector(nn.Module):
                                   for kernel, stride in zip(kernel_sizes, strides)])
         self.strides = strides
         self.kernel_sizes = kernel_sizes
-        self.positional_embedding = SinusoidalPositionalEmbedding(dim_output, max_len = 512)
+        self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout = 0, causal=False)
                                      for _ in range(num_connector_layers)])
         
