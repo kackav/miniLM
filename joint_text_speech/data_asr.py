@@ -55,7 +55,7 @@ class TextDataset(torch.utils.data.Dataset):
         label = text
         
         return {"text_trans" : text,
-                "input_ids" : self.bos + self.tokenizer.encode(inp),
+                "input_ids" : self.bos_token + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
                 "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
                 "labels_len" : len(self.tokenizer.encode(label)) + 1

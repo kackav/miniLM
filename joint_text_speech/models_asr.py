@@ -269,7 +269,7 @@ class Connector(nn.Module):
                                   for kernel, stride in zip(kernel_sizes, strides)])
         self.strides = strides
         self.kernel_sizes = kernel_sizes
-        self.positional_embedding = SinusoidalPositionalEmbedding(dim_output, max_len=512)
+        self.positional_embedding = SinusoidalPositionalEmbedding(dim_output, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout = 0, causal=False)
                                      for _ in range(num_connector_layers)])
         

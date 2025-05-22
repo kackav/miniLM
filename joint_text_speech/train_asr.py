@@ -280,7 +280,7 @@ def main():
     train_text_loader_iter = iter(train_text_loader)
 
     normalizer = EnglishSpellingNormalizer()
-    
+
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
         if args.connector_eval:
