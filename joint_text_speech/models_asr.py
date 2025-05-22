@@ -157,12 +157,20 @@ class TextEncoder(nn.Module):
             # "labels": labels,
             # "labels_len": labels_len
             # }
+        print(x['input_ids'].shape)
+        print(x['input_ids'][0])
+        
         features = self.embedding(x['input_ids'])
+        print(features[0])
         text_length = x['input_len']
+        print(text_length[0])
         features = self.positional_embedding(features)
-
-        mask = torch.rand(features.shape[0], features.shape[1], device=features.device)
+        print(features.shape)
+        mask = torch.rand((features.shape[0], features.shape[1], 1), device=features.device)
+        print("mask")
+        print(mask[0])
         features = torch.where(mask>self.mask_rate, features, torch.zeros_like(features))
+        print(features[0])
         for block in self.blocks:
             features = block(features)
 

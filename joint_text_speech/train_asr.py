@@ -222,7 +222,7 @@ def main():
     train_text_data = data_asr.TextDataset(dset_text_train, tokenizer, bos_token)
 
     encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-    text_encoder = models_asr.TextEncoder(args.mask_rate, args.bpe_vocab_size, args.text_encoder_dim, args.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
+    text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
     text_encoder = text_encoder.to(torch.bfloat16)
     connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     connector = connector.to(torch.bfloat16)
@@ -301,6 +301,8 @@ def main():
             try:
                 batch_s = next(train_asr_loader_iter)
                 batch_t = next(train_text_loader_iter)
+                print(batch_t['text_trans'][0])
+                print(batch_t['input_ids'][0])
             except StopIteration:
                 train_asr_loader_iter = iter(train_asr_loader)
                 train_text_loader_iter = iter(train_text_loader)

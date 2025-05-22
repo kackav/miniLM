@@ -53,7 +53,7 @@ class TextDataset(torch.utils.data.Dataset):
         text = self.data[idx]['text']
         inp =  text
         label = text
-        
+        print(text)
         return {"text_trans" : text,
                 "input_ids" : self.bos_token + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
@@ -136,8 +136,10 @@ def collate_fn_text(batch, tokenizer=None):
 
     input_len = torch.tensor([_['input_len'] for _ in batch], dtype=torch.int)
     labels_len = torch.tensor([_['labels_len'] for _ in batch], dtype=torch.int)
-
-    return {"input_ids": input_ids,
+    text_trans = [_['text_trans'] for _ in batch]
+    
+    return {"text_trans" : text_trans,
+            "input_ids": input_ids,
             "input_len": input_len,
             "labels": labels,
             "labels_len": labels_len
@@ -152,7 +154,7 @@ def load_data(working_directory='data',
 
     with open(data_url, 'r', encoding='utf-8') as f:
         data = f.read()
-        data = [{'text': f'{_}\n'} for _ in data.split('\n') if _ ]
+        data = [{'text': f'{_.lower()}'} for _ in data.split('\n') if _ ]
         #    random.shuffle(data)
     n = len(data)
     train_data = data[:int(n * train_split_proportion)]
