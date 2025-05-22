@@ -130,7 +130,7 @@ class Transformer(nn.Module):
         self.embedding = nn.Embedding(
             num_embeddings, hidden_size, padding_idx=None if tokenizer is None else tokenizer.token_to_id('[PAD]')
         )
-        self.positional_embedding = SinusoidalPositionalEmbedding(hidden_size, max_len)
+        self.positional_embedding = PositionalEmbedding(hidden_size, max_len)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(hidden_size, num_heads, ff_size, dropout, causal=causal)
                                      for _ in range(num_layers)])
         self.output = nn.Linear(hidden_size, num_embeddings)
@@ -258,7 +258,7 @@ class Connector(nn.Module):
                                   for kernel, stride in zip(kernel_sizes, strides)])
         self.strides = strides
         self.kernel_sizes = kernel_sizes
-        self.positional_embedding = PositionalEmbedding(dim_input, max_len=512)
+        self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout = 0, causal=False)
                                      for _ in range(num_connector_layers)])
         
