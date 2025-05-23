@@ -209,7 +209,7 @@ class WavLMWrapper(nn.Module):
 
 
 class Connector(nn.Module):
-    def __init__(self, dim_input, dim_output, num_heads, ff_size, num_connector_layers = 2, kernel_sizes = (7,7), strides = (3,2)):
+    def __init__(self, dim_input, dim_output, num_heads, ff_size, num_connector_layers = 2, kernel_sizes = (7,7), strides = (3,2),  is_text = False):
         super(Connector, self).__init__()
         assert len(kernel_sizes) == len(strides), "kernel_sizes and strides must have the same length"
         self.cnn = nn.ModuleList([nn.Conv1d(dim_input, dim_input, kernel_size=kernel, stride=stride)
@@ -220,7 +220,8 @@ class Connector(nn.Module):
                                      for _ in range(num_connector_layers)])
         
         self.linear = nn.Linear(dim_input, dim_output)
-        self.config = {'dim_input': dim_input,
+        self.config = {'is_text': is_text,
+                       'dim_input': dim_input,
                        'dim_output': dim_output,
                        'num_heads': num_heads,
                        'ff_size': ff_size,
@@ -229,9 +230,10 @@ class Connector(nn.Module):
                        'strides': strides
                        }
    
-    def forward(self, x):
-        features = x['encoder_output']
-        speech_length = x['encoder_output_length']
+    def forward(self, x, is_text = False):
+        if not(is_text):
+            features = x['encoder_output']
+            speech_length = x['encoder_output_length']
         for i, (kernel_size, stride) in enumerate(zip(self.kernel_sizes, self.strides)):
             features = features.transpose(1, 2)
             features = self.cnn[i](features)
