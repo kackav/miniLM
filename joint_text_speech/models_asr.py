@@ -125,7 +125,7 @@ class TextEncoder(nn.Module):
                  tokenizer,
                  num_layers = 2,
                  dropout = 0,
-                 causal=True
+                 causal=False
                  ):
         super(TextEncoder, self).__init__()
         self.embedding = nn.Embedding(
@@ -156,21 +156,12 @@ class TextEncoder(nn.Module):
             # "input_len": input_len,
             # "labels": labels,
             # "labels_len": labels_len
-            # }
-        print(x['input_ids'].shape)
-        print(x['input_ids'][0])
-        
+            # }      
         features = self.embedding(x['input_ids'])
-        print(features[0])
         text_length = x['input_len']
-        print(text_length[0])
-        features = self.positional_embedding(features)
-        print(features.shape)
         mask = torch.rand((features.shape[0], features.shape[1], 1), device=features.device)
-        print("mask")
-        print(mask[0])
         features = torch.where(mask>self.mask_rate, features, torch.zeros_like(features))
-        print(features[0])
+        features = self.positional_embedding(features)
         for block in self.blocks:
             features = block(features)
 
@@ -301,14 +292,14 @@ class Connector(nn.Module):
                 features = self.cnn[i](features)
                 features = features.transpose(1, 2)
                 features = nn.functional.gelu(features)
-                input_length = (1 + (speech_length - kernel_size) / stride).int()
+                speech_length = (1 + (speech_length - kernel_size) / stride).int()
             features = self.positional_embedding(features)
+            input_length = speech_length
             features = features[:, :input_length.max().item(), :]
         else: #TextEncoder output
             #masked text embeddings with positional embeddings.
             features = x['TextEncoder_output']
             input_length = x['TextEncoder_output_length']
-            # TODO: max lenght limitation for text encoder output also?
         for block in self.blocks:
             features = block(features)
 

@@ -53,7 +53,6 @@ class TextDataset(torch.utils.data.Dataset):
         text = self.data[idx]['text']
         inp =  text
         label = text
-        print(text)
         return {"text_trans" : text,
                 "input_ids" : self.bos_token + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
@@ -146,28 +145,10 @@ def collate_fn_text(batch, tokenizer=None):
             }
 
 
-def load_data(working_directory='data',
-                          name='librispeech',
-                          data_url='/mnt/matylda6/ivendrame/miniLM/data/librispeech_shuf.txt',
-                          train_split_proportion=0.9999,
-                          ):
-
-    with open(data_url, 'r', encoding='utf-8') as f:
-        data = f.read()
-        data = [{'text': f'{_.lower()}'} for _ in data.split('\n') if _ ]
-        #    random.shuffle(data)
-    n = len(data)
-    train_data = data[:int(n * train_split_proportion)]
-    val_data = data[int(n * train_split_proportion):]
-
-    return train_data, val_data
-
-
 def load_from_textfile(textfile_path='/mnt/matylda6/ivendrame/miniLM/data/librispeech_shuf.txt'):
 
     with open(textfile_path, 'r', encoding='utf-8') as f:
-        data = f.read()
-        data = [{'text': f'{_}\n'} for _ in data.split('\n') if _ and len(_.split())< 231]
+        data = [{'text': f'{_.strip().lower()}'} for _ in f.readlines() if _.strip() and len(_.split())< 231]
 
         return data
     
