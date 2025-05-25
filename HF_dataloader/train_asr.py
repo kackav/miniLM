@@ -15,6 +15,8 @@ from torch.utils.tensorboard import SummaryWriter
 import transformers
 from whisper_normalizer.english import EnglishSpellingNormalizer
 
+import datasets
+
 def lr_lambda_linear_with_min_lr(step, args):
     peak_lr = args.peak_lr
     min_lr = peak_lr * args.min_lr_ratio
@@ -124,10 +126,8 @@ def main():
     parser.add_argument('--generate', action='store_true',
                         help='generate from latest')
     
-    parser.add_argument('--train_asr_dir', type=str, default=None,
+    parser.add_argument('--train_dir', type=str, default=None,
                         help='train dataset dir')
-    parser.add_argument('--train_text_dir', type=str, default=None,
-                        help='train text dataset dir')
     parser.add_argument('--val_dir', type=str, default=None,
                         help='val dataset dir')
     parser.add_argument('--log_dir', type=str, default=None,
@@ -154,38 +154,84 @@ def main():
                         help='eval mode for connector during training, if False train mode')
     parser.add_argument('--lm_eval', action='store_true',
                         help='eval mode for lm during training, if False train mode')
-    
-    parser.add_argument('--text_weight', type=float, default=0.5,
-                        help='weight for text encoder loss')
-    parser.add_argument('--mask_rate', type=float, default=0.15,
-                        help='mask rate for text encoder')
-    parser.add_argument('--text_encoder_dim', type=int, default=512,
-                        help='text encoder dimension')
-    
 
     args = parser.parse_args()
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.output_dir
+    
     #torch.set_default_dtype(torch.bfloat16)
     torch.set_float32_matmul_precision('high')
+
+    for arg in vars(args):
+        print(f'{arg}: {getattr(args, arg)}')
 
     safe_gpu.claim_gpus()
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
 
     writer = SummaryWriter(log_dir=args.log_dir)
+    val_file = {"validation": args.val_dir}
+    train_file = {"train" : args.train_dir}
+    dset_train = datasets.load_dataset('librispeech_asr', data_files = train_file, split='train')
+    dset_valid = datasets.load_dataset('librispeech_asr', data_files = val_file, split='validation')
+
+    # dset_train = data_asr.load_from_transcript(train_file, args.audio_dir)
+    # dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
+    # trans_train = [{"text": _["text"][0]} for _ in dset_train]
+    
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
+
+    train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir, args.bos_token)
+
+    encoder = models_asr.WavLMWrapper(args.encoder_model_name)
+    connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
+    connector = connector.to(torch.bfloat16)
+    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
+   #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    
+    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer)
+    model = model.to(device)
+    
+    if not args.train_encoder:
+        model.freeze_encoder()
+    if not args.train_lm:
+        model.freeze_lm()
+
+    parameters_to_train = list(model.connector.parameters())
+    if args.train_encoder:
+        parameters_to_train += list(model.encoder.parameters())
+    if args.train_lm:
+        parameters_to_train += list(model.lm.parameters())
+    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+    
+    print(model.config)
+    
+    print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
+    print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+
+    lr_lambda_partial = functools.partial(lr_lambda, args=args)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
+
+    # Running variables for keeping track of training metrics
+    train_loss = 0
+    training_acc = 0
+    training_count = 0
+    best_val_loss = float('inf')
+    all_metrics = []
 
     bos_token = args.bos_token
     lm_model_name = args.lm_model_name
-    
-    # TODO: add support for resuming from checkpoint FOR TEXT INPUT
+
     if args.resume:
         print('Resuming from checkpoint')
-        connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-        connector = connector.to(torch.bfloat16)
-        connector = connector.to(device)
+        model.connector = model.connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+        model.connector = model.connector.to(torch.bfloat16)
+        model.connector = model.connector.to(device)
         if args.train_encoder:
-            encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-            encoder= encoder.to(torch.bfloat16)
-            encoder = encoder.to(device)
-
+            model.encoder = model.encoder.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+            model.encoder = model.encoder.to(torch.bfloat16)
+            model.encoder = model.encoder.to(device)
+        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
+        scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
         if os.path.isfile(os.path.join(args.output_dir, 'lm_config.yaml')):
             with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'r') as f:
                 lm_config = yaml.load(f, Loader=yaml.FullLoader)
@@ -199,88 +245,24 @@ def main():
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
 
-    # tokenizer
-    if args.tokenizer_dir is None:
-        args.tokenizer_dir = args.output_dir
+    model.lm = transformers.AutoModelForCausalLM.from_pretrained(lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
     tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
-    
-    for arg in vars(args):
-        print(f'{arg}: {getattr(args, arg)}')
+    train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir, bos_token)
+    validation_data = data_asr.AsrDataset(dset_valid, tokenizer, args.audio_dir, bos_token)
 
-    # validation set
-    val_file = args.val_dir
-    dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
-    validation_data = data_asr.AudioDataset(dset_valid, tokenizer, args.audio_dir, bos_token)
-    # train asr set
-    train_asr_file = args.train_asr_dir
-    dset_asr_train = data_asr.load_from_transcript(train_asr_file, args.audio_dir)
-    train_asr_data = data_asr.AudioDataset(dset_asr_train, tokenizer, args.audio_dir, bos_token)
-    trans_train = [{"text": _["text"][0]} for _ in dset_asr_train]
-    # train text set
-    train_text_file = args.train_text_dir
-    dset_text_train = data_asr.load_from_textfile(train_text_file) # dict[{'text': text}] with max len 231!
-    train_text_data = data_asr.TextDataset(dset_text_train, tokenizer, bos_token)
-
-    encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-    text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
-    text_encoder = text_encoder.to(torch.bfloat16)
-    connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
-    connector = connector.to(torch.bfloat16)
-    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
-   #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
-    
-    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, text_encoder, connector, lm, tokenizer)
-    model = model.to(device)
-    
-    if not args.train_encoder:
-        model.freeze_encoder()
-    if not args.train_lm:
-        model.freeze_lm()
-
-    parameters_to_train = list(model.connector.parameters())
-    if args.train_encoder:
-        parameters_to_train += list(model.encoder.parameters())
-    if args.train_lm:
-        parameters_to_train += list(model.lm.parameters())
-
-    print(model.config)
-    
-    print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
-    print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
-
-    # training
-    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
-    lr_lambda_partial = functools.partial(lr_lambda, args=args)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
-    if args.resume:
-        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
-        scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
-    # Running variables for keeping track of training metrics
-    train_loss = 0
-    training_acc = 0
-    training_count = 0
-    best_val_loss = float('inf')
-    all_metrics = []
-
-    collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
-    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_batch_size,
-                                               collate_fn=collate_fn_asr,
+    collate_fn = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.per_device_train_batch_size,
+                                               collate_fn=collate_fn,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)
                                           #     drop_last=True)
-    train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_batch_size,
-                                               collate_fn=collate_fn_text,
-                                               shuffle=True,
-                                               num_workers=args.dataloader_num_workers)                                    
+                                        
     validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
-                                                    collate_fn=collate_fn_asr,
+                                                    collate_fn=collate_fn,
                                                     num_workers=args.dataloader_num_workers)
-    train_asr_loader_iter = iter(train_asr_loader)  
-    train_text_loader_iter = iter(train_text_loader)
-
+    train_loader_iter = iter(train_loader)  
     normalizer = EnglishSpellingNormalizer()
-
+    #with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
         if args.connector_eval:
@@ -298,32 +280,21 @@ def main():
         for k in range(args.accumulation_steps):
             if args.generate:
                 break
+
             try:
-                batch_s = next(train_asr_loader_iter)
-                batch_t = next(train_text_loader_iter)
-                print(batch_t['text_trans'][0])
-                print(batch_t['input_ids'][0])
+                batch = next(train_loader_iter)
             except StopIteration:
-                train_asr_loader_iter = iter(train_asr_loader)
-                train_text_loader_iter = iter(train_text_loader)
-                batch_s = next(train_asr_loader_iter)
-                batch_t = next(train_text_loader_iter)
-            for key, value in batch_s.items():
+                train_loader_iter = iter(train_loader)
+                batch = next(train_loader_iter)
+            for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
-                    batch_s[key] = batch_s[key].to(device)
-            for key, value in batch_t.items():
-                if isinstance(value, torch.Tensor):
-                    batch_t[key] = batch_t[key].to(device)
-            x_s = batch_s
-            y_s = batch_s['labels'].to(device)
-            x_t = batch_t
-            y_t = batch_t['labels'].to(device)
+                    batch[key] = batch[key].to(device)
+            x = batch
+            y = batch['labels'].to(device)
 
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
-                z_s, loss_s, acc_s = model(x_s, is_text = False)
-                z_t, loss_t, acc_t = model(x_t, is_text = True)
-                loss = loss_s + args.text_weight*loss_t
-                acc = acc_s + args.text_weight*acc_t
+                z, loss, acc = model(x)
+
             (loss/args.accumulation_steps).backward()
 
             # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
@@ -336,9 +307,9 @@ def main():
             writer.add_scalar("Loss/train", loss, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
             writer.add_scalar("Accuracy/train", acc, j)
-            writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
+            writer.add_scalar("Data/Audio Length", batch['audio_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Text Length", batch['input_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Batch Size", batch['audio'].shape[0], j)
 
             # clip gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
@@ -420,15 +391,7 @@ def main():
 
             train_loss = train_loss / training_count
             training_acc = training_acc / training_count
-            val_loss = val_loss / val_count
-            writer.add_scalar("Loss/validation", val_loss, j)
-            val_acc = val_acc / val_count
-            writer.add_scalar("Accuracy/validation", val_acc, j)
-            writer.add_scalar("WER/wer", wer, j)
-            writer.add_scalar("WER/insertions", insertions, j)
-            writer.add_scalar("WER/deletions", deletions, j)
-            writer.add_scalar("WER/substitutions", substitutions, j)
-            writer.add_scalar("WER/cer", cer, j)
+            
             logging_dict = {
                 'step': j,
                 'train_loss': train_loss,

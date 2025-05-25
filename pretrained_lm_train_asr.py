@@ -12,8 +12,8 @@ from safe_gpu import safe_gpu
 
 import jiwer
 from torch.utils.tensorboard import SummaryWriter
+#from hf_olmo import OLMoForCausalLM, OLMoTokenizerFast
 import transformers
-from whisper_normalizer.english import EnglishSpellingNormalizer
 
 def lr_lambda_linear_with_min_lr(step, args):
     peak_lr = args.peak_lr
@@ -91,15 +91,15 @@ def main():
                         help='number of steps between saving model checkpoints')
     parser.add_argument('--warmup_steps', type=int, default=1000,
                         help='number of steps for linear warmup')
-    parser.add_argument('--early_stopping_patience', type=int, default=5,
+    parser.add_argument('--early_stopping_patience', type=int, default=30000,
                         help='number of validation runs to wait before early stopping')
     parser.add_argument('--max_steps', type=int, default=50000,
                         help='maximum number of steps to train for')
     parser.add_argument('--scheduler', type=str, default='linear', choices=['linear', 'cosine'],
                         help='learning rate scheduler to use')
-    parser.add_argument('--per_device_train_batch_size', type=int, default=8,
+    parser.add_argument('--per_device_train_batch_size', type=int, default=128,
                         help='batch size per device for training')
-    parser.add_argument('--per_device_eval_batch_size', type=int, default=8,
+    parser.add_argument('--per_device_eval_batch_size', type=int, default=128,
                         help='batch size per device for evaluation')
     parser.add_argument('--accumulation_steps', type=int, default=1,
                         help='number of steps to accumulate gradients for')
@@ -109,9 +109,7 @@ def main():
     parser.add_argument('--min_lr_ratio', type=float, default=0.4,
                         help='minimum learning rate as a ratio of peak learning rate')
 
-    parser.add_argument('--bos_token', type=str, default=None, 
-                        help="bos_token for lm, if None takes model.tokenizer.eos_token")
-    parser.add_argument('--weight_decay', type=float, default=0,
+    parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='weight decay')
     parser.add_argument('--max_grad_value', type=float, default=5.0,
                         help='maximum absolute gradient value for gradient clipping')
@@ -121,117 +119,79 @@ def main():
                         help='output directory to save model checkpoints and generated outputs')
     parser.add_argument('--resume', action='store_true',
                         help='resume training from latest')
-    parser.add_argument('--generate', action='store_true',
-                        help='generate from latest')
     
-    parser.add_argument('--train_asr_dir', type=str, default=None,
+    parser.add_argument('--train_dir', type=str, default=False,
                         help='train dataset dir')
-    parser.add_argument('--train_text_dir', type=str, default=None,
-                        help='train text dataset dir')
-    parser.add_argument('--val_dir', type=str, default=None,
+    parser.add_argument('--val_dir', type=str, default=False,
                         help='val dataset dir')
-    parser.add_argument('--log_dir', type=str, default=None,
+    parser.add_argument('--log_dir', type=str, default=False,
                         help='log runs dir')
-    parser.add_argument('--audio_dir', type=str, default=None,
+    parser.add_argument('--audio_dir', type=str, default=False,
                         help='audio dataset dir')
     parser.add_argument('--tokenizer_dir', type=str, default=None,
                         help='tokenizer dir')
-    parser.add_argument('--lm_dir', type=str, default=None,
+    parser.add_argument('--lm_dir', type=str, default=False,
                         help='lm dir')
-    parser.add_argument('--encoder_model_name', type=str, default='microsoft/wavlm-large',
-                        help='encoder model name')
-    parser.add_argument('--lm_model_name', type=str, default="allenai/OLMo-1B-hf",
-                        help='lm name as string')
 
     parser.add_argument('--train_encoder', action='store_true',
                         help='train encoder')
     parser.add_argument('--train_lm', action='store_true',
                         help='train lm')
     
-    parser.add_argument('--encoder_eval', action='store_true',
-                        help='eval mode for encoder during training, if False train mode')
-    parser.add_argument('--connector_eval', action='store_true',
-                        help='eval mode for connector during training, if False train mode')
-    parser.add_argument('--lm_eval', action='store_true',
-                        help='eval mode for lm during training, if False train mode')
-    
-    parser.add_argument('--text_weight', type=float, default=0.5,
-                        help='weight for text encoder loss')
-    parser.add_argument('--mask_rate', type=float, default=0.15,
-                        help='mask rate for text encoder')
-    parser.add_argument('--text_encoder_dim', type=int, default=512,
-                        help='text encoder dimension')
-    
+
 
     args = parser.parse_args()
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.output_dir
     #torch.set_default_dtype(torch.bfloat16)
     torch.set_float32_matmul_precision('high')
 
-    safe_gpu.claim_gpus()
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
-
-    writer = SummaryWriter(log_dir=args.log_dir)
-
-    bos_token = args.bos_token
-    lm_model_name = args.lm_model_name
-    
-    # TODO: add support for resuming from checkpoint FOR TEXT INPUT
-    if args.resume:
-        print('Resuming from checkpoint')
-        connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-        connector = connector.to(torch.bfloat16)
-        connector = connector.to(device)
-        if args.train_encoder:
-            encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-            encoder= encoder.to(torch.bfloat16)
-            encoder = encoder.to(device)
-
-        if os.path.isfile(os.path.join(args.output_dir, 'lm_config.yaml')):
-            with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'r') as f:
-                lm_config = yaml.load(f, Loader=yaml.FullLoader)
-            lm_model_name = lm_config['model_name']
-            bos_token = lm_config['bos_token']
-        else:
-            lm_model_name = args.lm_model_name
-            bos_token = args.bos_token
-        
-        with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
-            all_metrics = yaml.safe_load(f)
-        best_val_loss = min([m['val_loss'] for m in all_metrics])
-
-    # tokenizer
-    if args.tokenizer_dir is None:
-        args.tokenizer_dir = args.output_dir
-    tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
-    
     for arg in vars(args):
         print(f'{arg}: {getattr(args, arg)}')
 
-    # validation set
-    val_file = args.val_dir
-    dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
-    validation_data = data_asr.AudioDataset(dset_valid, tokenizer, args.audio_dir, bos_token)
-    # train asr set
-    train_asr_file = args.train_asr_dir
-    dset_asr_train = data_asr.load_from_transcript(train_asr_file, args.audio_dir)
-    train_asr_data = data_asr.AudioDataset(dset_asr_train, tokenizer, args.audio_dir, bos_token)
-    trans_train = [{"text": _["text"][0]} for _ in dset_asr_train]
-    # train text set
-    train_text_file = args.train_text_dir
-    dset_text_train = data_asr.load_from_textfile(train_text_file) # dict[{'text': text}] with max len 231!
-    train_text_data = data_asr.TextDataset(dset_text_train, tokenizer, bos_token)
+    safe_gpu.claim_gpus()
+    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
+    # dset = datasets.load_dataset(args.dataset, args.dataset_name)
+    # dset_train = dset[args.train_split]
+    # dset[args.valid_split]
 
-    encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-    text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
-    text_encoder = text_encoder.to(torch.bfloat16)
+    # train on Librispeech dataset shuf.txt
+    ## dset_train, dset_valid = data_minimal.load_data()
+    writer = SummaryWriter(log_dir=args.log_dir)
+
+    val_file = args.val_dir
+    train_file = args.train_dir
+    dset_train = data_asr.load_from_transcript(train_file, args.audio_dir)
+    dset_valid = data_asr.load_from_transcript(val_file, args.audio_dir)
+   # print(dset_train[0])
+    trans_train = [{"text": _["text"][0]} for _ in dset_train]
+    
+    tokenizer = transformers.AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True)
+    train_data = data_asr.AsrDataset(dset_train, tokenizer, args.audio_dir)
+    validation_data = data_asr.AsrDataset(dset_valid, tokenizer, args.audio_dir)
+
+    collate_fn = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.per_device_train_batch_size,
+                                               collate_fn=collate_fn,
+                                               shuffle=True,
+                                               num_workers=args.dataloader_num_workers)
+
+    validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
+                                                    collate_fn=collate_fn,
+                                                    num_workers=args.dataloader_num_workers)
+    encoder = models_asr.WavLMWrapper()
     connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     connector = connector.to(torch.bfloat16)
-    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
-   #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    lm = transformers.AutoModelForCausalLM.from_pretrained("allenai/OLMo-1B-hf", trust_remote_code=True,
+                                                           torch_dtype=torch.bfloat16,
+                                                           attn_implementation='flash_attention_2',
+                                                           device_map='auto')
+
+    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
-    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, text_encoder, connector, lm, tokenizer)
+    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer)
     model = model.to(device)
-    
+
     if not args.train_encoder:
         model.freeze_encoder()
     if not args.train_lm:
@@ -242,19 +202,17 @@ def main():
         parameters_to_train += list(model.encoder.parameters())
     if args.train_lm:
         parameters_to_train += list(model.lm.parameters())
-
-    print(model.config)
+    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
     
+    print(model.config)
     print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
-    # training
-    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
     lr_lambda_partial = functools.partial(lr_lambda, args=args)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
-    if args.resume:
-        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
-        scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
+
+    train_loader_iter = iter(train_loader)
+
     # Running variables for keeping track of training metrics
     train_loss = 0
     training_acc = 0
@@ -262,68 +220,33 @@ def main():
     best_val_loss = float('inf')
     all_metrics = []
 
-    collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
-    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_batch_size,
-                                               collate_fn=collate_fn_asr,
-                                               shuffle=True,
-                                               num_workers=args.dataloader_num_workers)
-                                          #     drop_last=True)
-    train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_batch_size,
-                                               collate_fn=collate_fn_text,
-                                               shuffle=True,
-                                               num_workers=args.dataloader_num_workers)                                    
-    validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
-                                                    collate_fn=collate_fn_asr,
-                                                    num_workers=args.dataloader_num_workers)
-    train_asr_loader_iter = iter(train_asr_loader)  
-    train_text_loader_iter = iter(train_text_loader)
-
-    normalizer = EnglishSpellingNormalizer()
-
+    if args.resume:
+        print('Resuming from checkpoint')
+        model.connector = model.connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
+        scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
+        with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
+            all_metrics = yaml.safe_load(f)
+        best_val_loss = min([m['val_loss'] for m in all_metrics])
+#    with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
     for j in tqdm.tqdm(range(1, args.max_steps + 1)):
         optimizer.zero_grad()
-        if args.connector_eval:
-            model.connector.eval()
-        else:
-            model.connector.train()
-        if args.encoder_eval:
-            model.encoder.eval()
-        else:
-            model.encoder.train()
-        if args.lm_eval:
-            model.lm.eval()
-        else:
-            model.lm.train()
+        
         for k in range(args.accumulation_steps):
-            if args.generate:
-                break
-            try:
-                batch_s = next(train_asr_loader_iter)
-                batch_t = next(train_text_loader_iter)
-                print(batch_t['text_trans'][0])
-                print(batch_t['input_ids'][0])
-            except StopIteration:
-                train_asr_loader_iter = iter(train_asr_loader)
-                train_text_loader_iter = iter(train_text_loader)
-                batch_s = next(train_asr_loader_iter)
-                batch_t = next(train_text_loader_iter)
-            for key, value in batch_s.items():
-                if isinstance(value, torch.Tensor):
-                    batch_s[key] = batch_s[key].to(device)
-            for key, value in batch_t.items():
-                if isinstance(value, torch.Tensor):
-                    batch_t[key] = batch_t[key].to(device)
-            x_s = batch_s
-            y_s = batch_s['labels'].to(device)
-            x_t = batch_t
-            y_t = batch_t['labels'].to(device)
 
+            try:
+                batch = next(train_loader_iter)
+            except StopIteration:
+                train_loader_iter = iter(train_loader)
+                batch = next(train_loader_iter)
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = batch[key].to(device)
+            x = batch
+            y = batch['labels'].to(device)
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
-                z_s, loss_s, acc_s = model(x_s, is_text = False)
-                z_t, loss_t, acc_t = model(x_t, is_text = True)
-                loss = loss_s + args.text_weight*loss_t
-                acc = acc_s + args.text_weight*acc_t
+                z, loss, acc = model(x)
+            # loss = criterion(z.permute(0, 2, 1), y)
             (loss/args.accumulation_steps).backward()
 
             # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
@@ -331,23 +254,18 @@ def main():
             # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
             training_acc += acc.mean().item()
             training_count += 1
+            
+        writer.add_scalar("Loss/train", loss, j)
+        writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
+        writer.add_scalar("Accuracy/train", acc, j)
 
-        if not(args.generate):
-            writer.add_scalar("Loss/train", loss, j)
-            writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
-            writer.add_scalar("Accuracy/train", acc, j)
-            writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
 
-            # clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-            # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
-            writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-
+        # clip gradients
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+        torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
         if j > 0 and j % args.validation_steps == 0:
             model.eval()
             with torch.no_grad():
@@ -372,9 +290,8 @@ def main():
                     val_acc += acc.mean().item()
                     val_count += 1
 
-                    with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                        text_x = [normalizer(text_str) for text_str in model.generate(val_x, 100, bos_token = bos_token)]
-                    text_y = [normalizer(text_str) for text_str in val_batch['text_trans']]
+                    text_x = model.generate(val_x, 100)
+                    text_y = val_batch['text_trans']
                     all_transcriptions += text_x
                     all_references += text_y
 
@@ -384,8 +301,7 @@ def main():
                 substitutions = output_wer.substitutions
                 wer = output_wer.wer
                 cer = jiwer.cer(all_references, all_transcriptions)
-                print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
-            
+
             full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
             #full_trt = sorted(full_trt, key=lambda x: x[0])
             to_write = full_trt[:50]
@@ -395,29 +311,8 @@ def main():
             '|------------|---------------|\n'] + to_write
             to_write = ''.join(to_write)
             writer.add_text('WER', to_write, j)
-            #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
-            if args.generate:
 
-                val_loss = val_loss / val_count
-                writer.add_scalar("Loss/validation", val_loss, j)
-                val_acc = val_acc / val_count
-                writer.add_scalar("Accuracy/validation", val_acc, j)
-                writer.add_scalar("WER/wer", wer, j)
-                writer.add_scalar("WER/insertions", insertions, j)
-                writer.add_scalar("WER/deletions", deletions, j)
-                writer.add_scalar("WER/substitutions", substitutions, j)
-                writer.add_scalar("WER/cer", cer, j)
-                logging_dict = {
-                'step': j,
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'wer' : wer,
-                }
-                print(logging_dict)
-                yaml.dump(logging_dict, open(os.path.join(args.output_dir, 'latest', 'val_metrics.yaml'), 'w'))
-                writer.flush()
-                os._exit(0)
-
+            #([tokenizer.decode(x['input_ids'].tolist()) for x in val_batch], [tokenizer.decode(x['labels'].tolist()) for x in val_batch])
             train_loss = train_loss / training_count
             training_acc = training_acc / training_count
             val_loss = val_loss / val_count
@@ -440,34 +335,21 @@ def main():
                 }
             all_metrics.append(logging_dict)
             print(logging_dict)
+            model.train()
             train_loss = 0
             training_acc = 0
             training_count = 0
 
             model.connector.save_to_directory(os.path.join(args.output_dir, 'latest'))
-            if args.train_encoder:
-                model.encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
-            lm_config = {'model_name' : lm_model_name,
-                 'bos_token' : bos_token,
-            }
-            with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w') as f:
-                yaml.dump(lm_config, f)
-    
-            yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
-
-
             # save otpimizer state
             torch.save(optimizer.state_dict(), os.path.join(args.output_dir, 'latest', 'optimizer.pt'))
             # save scheduler state
             torch.save(scheduler.state_dict(), os.path.join(args.output_dir, 'latest', 'scheduler.pt'))
-
-           # yaml.dump(model.config, open(os.path.join(args.output_dir, 'latest', 'config.yaml'), 'w'))
+            yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model.connector.save_to_directory(os.path.join(args.output_dir, 'best'))
-                if args.train_encoder:
-                    model.encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
             recent_val_loss = [m['val_loss'] for m in all_metrics[-args.early_stopping_patience:]]
             all_val_losses = [m['val_loss'] for m in all_metrics]
@@ -477,12 +359,26 @@ def main():
 
         if j % args.save_steps == 0:
             model.connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
-            if args.train_encoder:
-              model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
     
         writer.flush()
-            
+        
+
+        # # After training is done, the following could be run standalone e.g. in a jupyter notebook to play around with the model
+        # # Load the best model
+        # model = models_minimal.Transformer.load_from_dir(os.path.join(args.output_dir, args.decode_checkpoint), device)
+        # tokenizer = data_minimal.load_tokenizer(os.path.join(args.output_dir, f'bpe_tokenizer_{args.bpe_vocab_size}.json'))
+
+        # # Generate 5 paragraphs of up to 100 tokens each from the model and save into a file
+        # x = tokenizer.token_to_id('[BOS]') * torch.ones(5, 1, dtype=torch.long, )
+        # z = model.generate(x, 100, temperature=1.0)
+        # # decode
+        # sentences = tokenizer.decode_batch(z.tolist())
+        # with open(os.path.join(args.output_dir, f'generated.txt'), 'w') as f:
+        #     for sentence in sentences:
+        #         f.write(sentence + '\n')
+        #         print(sentence)
+    
     print('Training complete!')
 
 
