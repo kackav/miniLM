@@ -101,106 +101,75 @@ class PositionalEmbedding(nn.Module):
     def forward(self, x):
         return x + self.embedding[:x.shape[1]].unsqueeze(0)
 
-class SinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, hidden_size, max_len):
-        super(SinusoidalPositionalEmbedding, self).__init__()
-        embedding = torch.zeros(max_len, hidden_size)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, hidden_size, 2) * -(torch.log(torch.tensor(10000.0)) / hidden_size))
-        embedding[:, 0::2] = torch.sin(position * div_term)
-        embedding[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('embedding', embedding)
 
-    def forward(self, x):
-        return x + self.embedding[:x.shape[1]].unsqueeze(0)
-    
-class TextEncoder(nn.Module):
+class Transformer(nn.Module):
     def __init__(self,
-                 mask_rate,
-                 vocab_size,
-                 dim_input,
-                 dim_output,
+                 num_embeddings,
+                 hidden_size,
                  num_heads,
-                 ff_size,                 
-                 tokenizer,
-                 num_layers = 2,
-                 dropout = 0,
+                 ff_size,
+                 num_layers,
+                 max_len,
+                 dropout,
+                 tokenizer=None,
                  causal=True
                  ):
-        super(TextEncoder, self).__init__()
+        super(Transformer, self).__init__()
         self.embedding = nn.Embedding(
-            vocab_size, dim_input, padding_idx=tokenizer.pad_token_id)
-        self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
-        self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout, causal=causal)
+            num_embeddings, hidden_size, padding_idx=None if tokenizer is None else tokenizer.token_to_id('[PAD]')
+        )
+        self.positional_embedding = PositionalEmbedding(hidden_size, max_len)
+        self.blocks = nn.ModuleList([TransformerEncoderBlock(hidden_size, num_heads, ff_size, dropout, causal=causal)
                                      for _ in range(num_layers)])
-        self.mask_rate = mask_rate
-        self.linear = nn.Linear(dim_input, dim_output)
+        self.output = nn.Linear(hidden_size, num_embeddings)
 
-        self.config = {
-            'mask_rate': mask_rate,
-            'vocab_size': vocab_size,
-            'dim_input': dim_input,
-            'dim_output': dim_output,
-            'num_heads': num_heads,
-            'ff_size': ff_size,
-            'num_layers': num_layers,
-            'dropout': dropout,
-            'tokenizer': tokenizer.__dict__,
-            'causal': causal,
-        }
+        self.config = {'num_embeddings': num_embeddings,
+                       'hidden_size': hidden_size,
+                       'num_heads': num_heads,
+                       'ff_size': ff_size,
+                       'num_layers': num_layers,
+                       'max_len': max_len,
+                       'dropout': dropout,
+                       'causal': causal,
+                       }
 
-    def forward(self, x):
-        # x looks like this: 
-            # "text_trans" : text_trans,
-            # "input_ids": input_ids,
-            # "input_len": input_len,
-            # "labels": labels,
-            # "labels_len": labels_len
-            # }
-        print(x['input_ids'].shape)
-        print(x['input_ids'][0])
-        
-        features = self.embedding(x['input_ids'])
-        print(features[0])
-        text_length = x['input_len']
-        print(text_length[0])
-        features = self.positional_embedding(features)
-        print(features.shape)
-        mask = torch.rand((features.shape[0], features.shape[1], 1), device=features.device)
-        print("mask")
-        print(mask[0])
-        features = torch.where(mask>self.mask_rate, features, torch.zeros_like(features))
-        print(features[0])
+    def forward(self, x, input_is_embeddings=False):
+        if not input_is_embeddings:
+            x = self.embedding(x)
+            x = self.positional_embedding(x)
         for block in self.blocks:
-            features = block(features)
-
-        x['TextEncoder_output'] = self.linear(features)
-        x['TextEncoder_output_length'] = text_length
-        # x should look like this: 
-            # "text_trans" : text_trans,
-            # "input_ids": input_ids,
-            # "input_len": input_len,
-            # "labels": labels,
-            # "labels_len": labels_len,
-            # "TextEncoder_output" : TextEncoder_output,
-            # "TextEncoder_output_length" : TextEncoder_output_length
-            # }
-
+            x = block(x)
+        x = self.output(x)
         return x
 
     def save_to_directory(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, 'TextEncoder_config.yaml'), 'w') as f:
+        with open(os.path.join(output_dir, 'lm_config.yaml'), 'w') as f:
             yaml.dump(self.config, f)
-        torch.save(self.state_dict(), os.path.join(output_dir, 'TextEncoder_model.pt'))
+        torch.save(self.state_dict(), os.path.join(output_dir, 'lm_model.pt'))
 
     @classmethod
     def load_from_dir(cls, output_dir, device=None):
-        with open(os.path.join(output_dir, 'TextEncoder_config.yaml'), 'r') as f:
+        with open(os.path.join(output_dir, 'lm_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(**config)
-        model.load_state_dict(torch.load(os.path.join(output_dir, 'TextEncoder_model.pt'), weights_only=True, map_location=device))
+        model.load_state_dict(torch.load(os.path.join(output_dir, 'lm_model.pt'), weights_only=True, map_location=device))
         return model
+
+    def generate_with_eos(self, x, max_len, eos_token, temperature=1.0):
+        self.eval()
+        x_still_active = torch.ones(x.shape[0], 1, device=x.device, dtype=torch.bool)
+        with torch.no_grad():
+            for _ in range(max_len):
+                z = self(x)
+                z = z[:, -1] / temperature
+                z = torch.multinomial(torch.softmax(z, dim=-1), 1)
+                z_to_concat = torch.where(x_still_active, z, torch.full_like(z, eos_token))
+                x = torch.cat([x, z_to_concat], dim=1)
+                x_still_active = x_still_active & (z != eos_token)
+                if not x_still_active.any():
+                    break
+        return x
 
 
 def lengths_to_mask(lengths: torch.Tensor):
@@ -277,7 +246,6 @@ class Connector(nn.Module):
                                   for kernel, stride in zip(kernel_sizes, strides)])
         self.strides = strides
         self.kernel_sizes = kernel_sizes
-        self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout = 0, causal=False)
                                      for _ in range(num_connector_layers)])
         
@@ -291,29 +259,21 @@ class Connector(nn.Module):
                        'strides': list(strides)
                        }
    
-    def forward(self, x, is_text = False):
-        if not(is_text): #encoder output
-            features = x['encoder_output']
-            speech_length = x['encoder_output_length']
-            features = nn.functional.gelu(features)
-            for i, (kernel_size, stride) in enumerate(zip(self.kernel_sizes, self.strides)):
-                features = features.transpose(1, 2)
-                features = self.cnn[i](features)
-                features = features.transpose(1, 2)
-                features = nn.functional.gelu(features)
-                input_length = (1 + (speech_length - kernel_size) / stride).int()
-            features = self.positional_embedding(features)
-            features = features[:, :input_length.max().item(), :]
-        else: #TextEncoder output
-            #masked text embeddings with positional embeddings.
-            features = x['TextEncoder_output']
-            input_length = x['TextEncoder_output_length']
-            # TODO: max lenght limitation for text encoder output also?
+    def forward(self, x):
+        features = x['encoder_output']
+        speech_length = x['encoder_output_length']
+        for i, (kernel_size, stride) in enumerate(zip(self.kernel_sizes, self.strides)):
+            features = features.transpose(1, 2)
+            features = self.cnn[i](features)
+            features = features.transpose(1, 2)
+            speech_length = (1 + (speech_length - kernel_size) / stride).int()
+    
+        features = features[:, :speech_length.max().item(), :]
         for block in self.blocks:
             features = block(features)
 
         x['connector_output'] = self.linear(features)
-        x['connector_output_length'] = input_length
+        x['connector_output_length'] = speech_length
         return x
     
     def save_to_directory(self, output_dir):
@@ -333,10 +293,9 @@ class Connector(nn.Module):
         return model
 
 class EncoderConnectorLmWithPretrainedLm(nn.Module):
-    def __init__(self, encoder, text_encoder, connector, lm, tokenizer):
+    def __init__(self, encoder, connector, lm, tokenizer):
         super(EncoderConnectorLmWithPretrainedLm, self).__init__()
         self.encoder = encoder
-        self.text_encoder = text_encoder
         self.connector = connector
         self.lm = lm
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -354,7 +313,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         for param in self.lm.parameters():
             param.requires_grad = False
 
-    def forward(self, x, is_text = False):
+    def forward(self, x):
         text, text_lengths = x['input_ids'], x['input_len']
         labels, labels_lengths = x['labels'], x['labels_len']
         if self.printing:
@@ -362,21 +321,14 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
             print(x['audio_len'])
             print(x['input_ids'].shape)
             print(x['input_len'])
-        if not is_text:
-            x = self.encoder(x)
-            if self.printing:
-                print('encoder')
-                print(x['encoder_output'].shape)
-                print(x['encoder_output_length'])
+        
+        x = self.encoder(x)
+        if self.printing:
+            print('encoder')
+            print(x['encoder_output'].shape)
+            print(x['encoder_output_length'])
 
-        else:
-            x = self.text_encoder(x)
-            if self.printing:
-                print('TextEncoder_output')
-                print(x['TextEncoder_output'].shape)
-                print(x['TextEncoder_output_length'])
-
-        x = self.connector(x, is_text = is_text)
+        x = self.connector(x)
         if self.printing:
             print('connector')
             print(x['connector_output'].shape)
