@@ -252,12 +252,19 @@ def main():
     print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     # training
-    optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
-    lr_lambda_partial = functools.partial(lr_lambda, args=args)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
     if args.resume:
+        optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+        lr_lambda_partial = functools.partial(lr_lambda, args=args)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
+        start_step = all_metrics[-1]['step']
         optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
         scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
+    else:
+        optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+        lr_lambda_partial = functools.partial(lr_lambda, args=args)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
+        start_step = 0
+    
     # Running variables for keeping track of training metrics
     train_loss = 0
     training_acc = 0
@@ -283,8 +290,8 @@ def main():
     train_text_loader_iter = iter(train_text_loader)
 
     normalizer = EnglishSpellingNormalizer()
-
-    for j in tqdm.tqdm(range(1, args.max_steps + 1)):
+    
+    for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1)):
         optimizer.zero_grad()
         if args.connector_eval:
             model.connector.eval()
@@ -369,7 +376,7 @@ def main():
                     
                     val_y = val_batch['labels'].to(device)
                     #val_z = model(val_x)
-                    with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
+                    with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                         z, loss, acc = model(val_x)
                     #loss = criterion(val_z.permute(0, 2, 1), val_y)
                     val_loss += (loss).mean().item()
@@ -405,13 +412,16 @@ def main():
 
                 val_loss = val_loss / val_count
                 writer.add_scalar("Loss/validation", val_loss, j)
-                val_acc = val_acc / val_count
+                val_acc = val_acc / val_count                         
                 writer.add_scalar("Accuracy/validation", val_acc, j)
                 writer.add_scalar("WER/wer", wer, j)
                 writer.add_scalar("WER/insertions", insertions, j)
                 writer.add_scalar("WER/deletions", deletions, j)
                 writer.add_scalar("WER/substitutions", substitutions, j)
                 writer.add_scalar("WER/cer", cer, j)
+                for _k, _p in model.named_parameters():
+                    if _p.requires_grad:
+                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().numpy(), j)
                 logging_dict = {
                 'step': j,
                 'val_loss': val_loss,
@@ -428,6 +438,7 @@ def main():
             val_loss = val_loss / val_count
             writer.add_scalar("Loss/validation", val_loss, j)
             val_acc = val_acc / val_count
+
             writer.add_scalar("Accuracy/validation", val_acc, j)
             writer.add_scalar("WER/wer", wer, j)
             writer.add_scalar("WER/insertions", insertions, j)
@@ -471,6 +482,7 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model.connector.save_to_directory(os.path.join(args.output_dir, 'best'))
+                model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 if args.train_encoder:
                     model.encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
@@ -482,6 +494,7 @@ def main():
 
         if j % args.save_steps == 0:
             model.connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
+            model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
             if args.train_encoder:
               model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
