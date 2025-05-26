@@ -97,8 +97,10 @@ def main():
                         help='maximum number of steps to train for')
     parser.add_argument('--scheduler', type=str, default='linear', choices=['linear', 'cosine'],
                         help='learning rate scheduler to use')
-    parser.add_argument('--per_device_train_batch_size', type=int, default=8,
-                        help='batch size per device for training')
+    parser.add_argument('--per_device_train_asr_batch_size', type=int, default=8,
+                        help='asr batch size per device for training')
+    parser.add_argument('--per_device_train_text_batch_size', type=int, default=8,
+                        help='text batch size per device for training')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=8,
                         help='batch size per device for evaluation')
     parser.add_argument('--accumulation_steps', type=int, default=1,
@@ -157,7 +159,7 @@ def main():
     
     parser.add_argument('--text_weight', type=float, default=0.5,
                         help='weight for text encoder loss')
-    parser.add_argument('--mask_rate', type=float, default=0.15,
+    parser.add_argument('--mask_rate', type=float, default=0.5,
                         help='mask rate for text encoder')
     parser.add_argument('--text_encoder_dim', type=int, default=512,
                         help='text encoder dimension')
@@ -238,6 +240,7 @@ def main():
         model.freeze_lm()
 
     parameters_to_train = list(model.connector.parameters())
+    parameters_to_train += list(model.text_encoder.parameters())
     if args.train_encoder:
         parameters_to_train += list(model.encoder.parameters())
     if args.train_lm:
@@ -264,12 +267,12 @@ def main():
 
     collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
     collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
-    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_batch_size,
+    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_asr,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)
                                           #     drop_last=True)
-    train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_batch_size,
+    train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)                                    
@@ -300,13 +303,13 @@ def main():
                 break
             try:
                 batch_s = next(train_asr_loader_iter)
-                batch_t = next(train_text_loader_iter)
-                print(batch_t['text_trans'][0])
-                print(batch_t['input_ids'][0])
             except StopIteration:
                 train_asr_loader_iter = iter(train_asr_loader)
-                train_text_loader_iter = iter(train_text_loader)
                 batch_s = next(train_asr_loader_iter)
+            try:
+                batch_t = next(train_text_loader_iter)
+            except StopIteration:
+                train_text_loader_iter = iter(train_text_loader)
                 batch_t = next(train_text_loader_iter)
             for key, value in batch_s.items():
                 if isinstance(value, torch.Tensor):
@@ -319,23 +322,25 @@ def main():
             x_t = batch_t
             y_t = batch_t['labels'].to(device)
 
-            with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16): 
+            with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                 z_s, loss_s, acc_s = model(x_s, is_text = False)
                 z_t, loss_t, acc_t = model(x_t, is_text = True)
                 loss = loss_s + args.text_weight*loss_t
-                acc = acc_s + args.text_weight*acc_t
+              
             (loss/args.accumulation_steps).backward()
 
             # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
             train_loss += loss.mean().item()
             # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
-            training_acc += acc.mean().item()
+            training_acc += acc_s.mean().item()
             training_count += 1
 
         if not(args.generate):
-            writer.add_scalar("Loss/train", loss, j)
+            writer.add_scalar("Loss/train", loss_s, j)
+            writer.add_scalar("Loss/text_rain", loss_t, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
-            writer.add_scalar("Accuracy/train", acc, j)
+            writer.add_scalar("Accuracy/train", acc_s, j)
+            writer.add_scalar("Accuracy/text_train", acc_t, j)
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
