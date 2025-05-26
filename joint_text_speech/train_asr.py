@@ -461,8 +461,10 @@ def main():
             training_count = 0
 
             model.connector.save_to_directory(os.path.join(args.output_dir, 'latest'))
+            model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
             if args.train_encoder:
                 model.encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
+
             lm_config = {'model_name' : lm_model_name,
                  'bos_token' : bos_token,
             }
