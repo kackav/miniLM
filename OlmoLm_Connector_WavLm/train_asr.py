@@ -215,7 +215,7 @@ def main():
 
     bos_token = args.bos_token
     lm_model_name = args.lm_model_name
-
+    start_step = 0
     if args.resume:
         print('Resuming from checkpoint')
         model.connector = model.connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
@@ -225,6 +225,15 @@ def main():
             model.encoder = model.encoder.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
             model.encoder = model.encoder.to(torch.bfloat16)
             model.encoder = model.encoder.to(device)
+        
+        parameters_to_train = list(model.connector.parameters())
+        if args.train_encoder:
+            parameters_to_train += list(model.encoder.parameters())
+        if args.train_lm:
+            parameters_to_train += list(model.lm.parameters())
+        optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+        lr_lambda_partial = functools.partial(lr_lambda, args=args)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
         optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
         scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
         if os.path.isfile(os.path.join(args.output_dir, 'lm_config.yaml')):
@@ -239,6 +248,7 @@ def main():
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
+        start_step = all_metrics[-1]['step']
 
     model.lm = transformers.AutoModelForCausalLM.from_pretrained(lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
     tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
@@ -258,7 +268,7 @@ def main():
     train_loader_iter = iter(train_loader)  
     normalizer = EnglishSpellingNormalizer()
     #with torch.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
-    for j in tqdm.tqdm(range(1, args.max_steps + 1)):
+    for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1)):
         optimizer.zero_grad()
         if args.connector_eval:
             model.connector.eval()
