@@ -149,6 +149,8 @@ def main():
                         help='train encoder')
     parser.add_argument('--train_lm', action='store_true',
                         help='train lm')
+    parser.add_argument('--text_input', action='store_true',
+                        help='use text and audio input for training, if False use audio input')
     
     parser.add_argument('--encoder_eval', action='store_true',
                         help='eval mode for encoder during training, if False train mode')
@@ -156,7 +158,9 @@ def main():
                         help='eval mode for connector during training, if False train mode')
     parser.add_argument('--lm_eval', action='store_true',
                         help='eval mode for lm during training, if False train mode')
-    
+    parser.add_argument('--text_encoder_eval', action='store_true',
+                        help='eval mode for text encoder during training, if False train mode')
+
     parser.add_argument('--text_weight', type=float, default=0.5,
                         help='weight for text encoder loss')
     parser.add_argument('--mask_rate', type=float, default=0.5,
@@ -176,16 +180,23 @@ def main():
 
     bos_token = args.bos_token
     lm_model_name = args.lm_model_name
-    
+
+    # tokenizer
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.output_dir
+
     # TODO: add support for resuming from checkpoint FOR TEXT INPUT
     if args.resume:
         print('Resuming from checkpoint')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-        connector = connector.to(torch.bfloat16)
+        #connector = connector.to(torch.bfloat16)
         connector = connector.to(device)
+        if args.text_input:
+            text_encoder = models_asr.TextEncoder.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+            text_encoder = text_encoder.to(device)
         if args.train_encoder:
             encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
-            encoder= encoder.to(torch.bfloat16)
+            #encoder= encoder.to(torch.bfloat16)
             encoder = encoder.to(device)
 
         if os.path.isfile(os.path.join(args.output_dir, 'lm_config.yaml')):
@@ -196,15 +207,20 @@ def main():
         else:
             lm_model_name = args.lm_model_name
             bos_token = args.bos_token
+        tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
         
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
-
-    # tokenizer
-    if args.tokenizer_dir is None:
-        args.tokenizer_dir = args.output_dir
-    tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
+    
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
+        encoder = models_asr.WavLMWrapper(args.encoder_model_name)
+        if args.text_input:
+            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
+            #text_encoder = text_encoder.to(torch.bfloat16)
+        connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
+        #connector = connector.to(torch.bfloat16)
     
     for arg in vars(args):
         print(f'{arg}: {getattr(args, arg)}')
@@ -219,19 +235,18 @@ def main():
     train_asr_data = data_asr.AudioDataset(dset_asr_train, tokenizer, args.audio_dir, bos_token)
     trans_train = [{"text": _["text"][0]} for _ in dset_asr_train]
     # train text set
-    train_text_file = args.train_text_dir
-    dset_text_train = data_asr.load_from_textfile(train_text_file) # dict[{'text': text}] with max len 231!
-    train_text_data = data_asr.TextDataset(dset_text_train, tokenizer, bos_token)
+    if args.text_input:
+        train_text_file = args.train_text_dir
+        dset_text_train = data_asr.load_from_textfile(train_text_file) # dict[{'text': text}] with max len 231!
+        train_text_data = data_asr.TextDataset(dset_text_train, tokenizer, bos_token)
 
-    encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-    text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
-    text_encoder = text_encoder.to(torch.bfloat16)
-    connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
-    connector = connector.to(torch.bfloat16)
     lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map='auto')
    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
-    model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, text_encoder, connector, lm, tokenizer)
+    if args.text_input:
+        model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, text_encoder, connector, lm, tokenizer)
+    else:
+        model = models_asr.EncoderConnectorLm(encoder, connector, lm, tokenizer)
     model = model.to(device)
     
     if not args.train_encoder:
@@ -273,22 +288,25 @@ def main():
     all_metrics = []
 
     collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
     train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_asr,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)
                                           #     drop_last=True)
-    train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
+    train_asr_loader_iter = iter(train_asr_loader)  
+    if args.text_input:
+        collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
+    
+        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)                                    
+        train_text_loader_iter = iter(train_text_loader)
+
     validation_loader = torch.utils.data.DataLoader(validation_data, batch_size=args.per_device_eval_batch_size,
                                                     collate_fn=collate_fn_asr,
                                                     num_workers=args.dataloader_num_workers)
-    train_asr_loader_iter = iter(train_asr_loader)  
-    train_text_loader_iter = iter(train_text_loader)
-
+    
     normalizer = EnglishSpellingNormalizer()
     
     for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1)):
@@ -305,6 +323,11 @@ def main():
             model.lm.eval()
         else:
             model.lm.train()
+        if args.text_encoder_eval:
+            model.text_encoder.eval()
+        else:
+            model.text_encoder.train()
+
         for k in range(args.accumulation_steps):
             if args.generate:
                 break
@@ -313,27 +336,34 @@ def main():
             except StopIteration:
                 train_asr_loader_iter = iter(train_asr_loader)
                 batch_s = next(train_asr_loader_iter)
-            try:
-                batch_t = next(train_text_loader_iter)
-            except StopIteration:
-                train_text_loader_iter = iter(train_text_loader)
-                batch_t = next(train_text_loader_iter)
             for key, value in batch_s.items():
                 if isinstance(value, torch.Tensor):
                     batch_s[key] = batch_s[key].to(device)
-            for key, value in batch_t.items():
-                if isinstance(value, torch.Tensor):
-                    batch_t[key] = batch_t[key].to(device)
             x_s = batch_s
             y_s = batch_s['labels'].to(device)
-            x_t = batch_t
-            y_t = batch_t['labels'].to(device)
+            if args.text_input:
+                try:
+                    batch_t = next(train_text_loader_iter)
+                except StopIteration:
+                    train_text_loader_iter = iter(train_text_loader)
+                    batch_t = next(train_text_loader_iter)
+                for key, value in batch_t.items():
+                    if isinstance(value, torch.Tensor):
+                        batch_t[key] = batch_t[key].to(device)
+                x_t = batch_t
+                y_t = batch_t['labels'].to(device)
+
+
 
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                 z_s, loss_s, acc_s = model(x_s, is_text = False)
-                z_t, loss_t, acc_t = model(x_t, is_text = True)
-                loss = loss_s + args.text_weight*loss_t
-              
+                
+                if args.text_input:
+                    z_t, loss_t, acc_t = model(x_t, is_text = True)
+                    loss = loss_s + args.text_weight*loss_t
+                else:
+                    loss = loss_s
+                
             (loss/args.accumulation_steps).backward()
 
             # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
@@ -344,10 +374,12 @@ def main():
 
         if not(args.generate):
             writer.add_scalar("Loss/train", loss_s, j)
-            writer.add_scalar("Loss/text_rain", loss_t, j)
+            if args.text_input:
+                writer.add_scalar("Loss/text_rain", loss_t, j)
+                writer.add_scalar("Accuracy/text_train", acc_t, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
-            writer.add_scalar("Accuracy/text_train", acc_t, j)
+            
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
@@ -461,7 +493,8 @@ def main():
             training_count = 0
 
             model.connector.save_to_directory(os.path.join(args.output_dir, 'latest'))
-            model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
+            if args.text_input:
+                model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
             if args.train_encoder:
                 model.encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
 
@@ -484,7 +517,8 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model.connector.save_to_directory(os.path.join(args.output_dir, 'best'))
-                model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
+                if args.text_input:
+                    model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 if args.train_encoder:
                     model.encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
@@ -496,9 +530,10 @@ def main():
 
         if j % args.save_steps == 0:
             model.connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
-            model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
+            if args.text_input:
+                model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
             if args.train_encoder:
-              model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
+                model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
     
         writer.flush()
