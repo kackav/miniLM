@@ -324,7 +324,7 @@ class Connector(nn.Module):
         return model
 
 class EncoderConnectorLmWithPretrainedLm(nn.Module):
-    def __init__(self, encoder, text_encoder, connector, lm, tokenizer):
+    def __init__(self, encoder, connector, lm, tokenizer, text_encoder=None):
         super(EncoderConnectorLmWithPretrainedLm, self).__init__()
         self.encoder = encoder
         self.text_encoder = text_encoder

@@ -244,9 +244,9 @@ def main():
    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
     if args.text_input:
-        model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, text_encoder, connector, lm, tokenizer)
+        model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
     else:
-        model = models_asr.EncoderConnectorLm(encoder, connector, lm, tokenizer)
+        model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer)
     model = model.to(device)
     
     if not args.train_encoder:
@@ -255,7 +255,8 @@ def main():
         model.freeze_lm()
 
     parameters_to_train = list(model.connector.parameters())
-    parameters_to_train += list(model.text_encoder.parameters())
+    if args.text_input:
+        parameters_to_train += list(model.text_encoder.parameters())
     if args.train_encoder:
         parameters_to_train += list(model.encoder.parameters())
     if args.train_lm:
@@ -323,10 +324,11 @@ def main():
             model.lm.eval()
         else:
             model.lm.train()
-        if args.text_encoder_eval:
-            model.text_encoder.eval()
-        else:
-            model.text_encoder.train()
+        if args.text_input:
+            if args.text_encoder_eval:
+                model.text_encoder.eval()
+            else:
+                model.text_encoder.train()
 
         for k in range(args.accumulation_steps):
             if args.generate:
@@ -451,9 +453,7 @@ def main():
                 writer.add_scalar("WER/deletions", deletions, j)
                 writer.add_scalar("WER/substitutions", substitutions, j)
                 writer.add_scalar("WER/cer", cer, j)
-                for _k, _p in model.named_parameters():
-                    if _p.requires_grad:
-                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().numpy(), j)
+
                 logging_dict = {
                 'step': j,
                 'val_loss': val_loss,
@@ -477,6 +477,9 @@ def main():
             writer.add_scalar("WER/deletions", deletions, j)
             writer.add_scalar("WER/substitutions", substitutions, j)
             writer.add_scalar("WER/cer", cer, j)
+            for _k, _p in model.named_parameters():
+                if _p.requires_grad:
+                    writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().numpy(), j)            
             logging_dict = {
                 'step': j,
                 'train_loss': train_loss,
