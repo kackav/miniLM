@@ -63,6 +63,49 @@ class SelfAttention(nn.Module):
         x = self.fc(x)
         return x
 
+class WavLMWrapper(nn.Module): 
+    def __init__(self, model_name="microsoft/wavlm-large"):
+        super().__init__()
+        self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+        self.encoder.config.mask_feature_prob = 0.0
+        self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
+        self.kernel_sizes = [_.conv.kernel_size[0] for _ in self.encoder.feature_extractor.conv_layers]
+        self.config = {
+            'model_name': model_name,
+            # 'strides': self.strides,
+            # 'kernel_sizes': self.kernel_sizes,
+            }
+        
+    def forward(self,  x: Dict[str, torch.Tensor]):
+        features = x['audio']
+        speech_length = x['audio_len']
+        attention_mask = lengths_to_mask(speech_length).long()
+        
+        for kernel_size, stride in zip(self.kernel_sizes, self.strides):
+            speech_length = (1 + (speech_length - kernel_size) / stride).int()
+
+        features = self.encoder(features, attention_mask=attention_mask)
+        features = features.last_hidden_state
+
+        x['encoder_output'] = features
+        x['encoder_output_length'] = speech_length
+        return x
+
+    def save_to_directory(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'w') as f:
+            yaml.dump(self.config, f)
+        torch.save(self.state_dict(), os.path.join(output_dir, 'encoder_model.pt'))
+    
+    @classmethod
+    def load_from_dir(cls, output_dir, device=None):
+        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        model = cls(**config)
+        model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
+        return model
+
+
 
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, ff_size, dropout, causal = True):
@@ -217,49 +260,6 @@ def shift_batch_right(input_tensor, lengths):
     return z
 
 
-class WavLMWrapper(nn.Module): 
-    def __init__(self, model_name="microsoft/wavlm-large"):
-        super().__init__()
-        self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-        self.encoder.config.mask_feature_prob = 0.0
-        self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
-        self.kernel_sizes = [_.conv.kernel_size[0] for _ in self.encoder.feature_extractor.conv_layers]
-        self.config = {
-            'model_name': model_name,
-            # 'strides': self.strides,
-            # 'kernel_sizes': self.kernel_sizes,
-            }
-        
-    def forward(self,  x: Dict[str, torch.Tensor]):
-        features = x['audio']
-        speech_length = x['audio_len']
-        attention_mask = lengths_to_mask(speech_length).long()
-        
-        for kernel_size, stride in zip(self.kernel_sizes, self.strides):
-            speech_length = (1 + (speech_length - kernel_size) / stride).int()
-
-        features = self.encoder(features, attention_mask=attention_mask)
-        features = features.last_hidden_state
-
-        x['encoder_output'] = features
-        x['encoder_output_length'] = speech_length
-        return x
-
-    def save_to_directory(self, output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'w') as f:
-            yaml.dump(self.config, f)
-        torch.save(self.state_dict(), os.path.join(output_dir, 'encoder_model.pt'))
-    
-    @classmethod
-    def load_from_dir(cls, output_dir, device=None):
-        with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
-        model = cls(**config)
-        model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
-        return model
-
-
 class Connector(nn.Module):
     def __init__(self, dim_input, dim_output, num_heads, ff_size, num_connector_layers = 2, kernel_sizes = (7,7), strides = (3,2)):
         super(Connector, self).__init__()
@@ -293,13 +293,15 @@ class Connector(nn.Module):
                 features = features.transpose(1, 2)
                 features = nn.functional.gelu(features)
                 speech_length = (1 + (speech_length - kernel_size) / stride).int()
-            features = self.positional_embedding(features)
+            
             input_length = speech_length
             features = features[:, :input_length.max().item(), :]
         else: #TextEncoder output
             #masked text embeddings with positional embeddings.
             features = x['TextEncoder_output']
             input_length = x['TextEncoder_output_length']
+        
+        features = self.positional_embedding(features)
         for block in self.blocks:
             features = block(features)
 

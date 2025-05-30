@@ -151,7 +151,8 @@ def main():
                         help='train lm')
     parser.add_argument('--text_input', action='store_true',
                         help='use text and audio input for training, if False use audio input')
-    
+    parser.add_argument('--train_with_asr_text', action='store_true',
+                        help='use text input from asr dataset for training, aligned with speech training, if False use text input from text dataset')
     parser.add_argument('--encoder_eval', action='store_true',
                         help='eval mode for encoder during training, if False train mode')
     parser.add_argument('--connector_eval', action='store_true',
@@ -185,7 +186,6 @@ def main():
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.output_dir
 
-    # TODO: add support for resuming from checkpoint FOR TEXT INPUT
     if args.resume:
         print('Resuming from checkpoint')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
@@ -342,6 +342,12 @@ def main():
                 if isinstance(value, torch.Tensor):
                     batch_s[key] = batch_s[key].to(device)
             x_s = batch_s
+            x_s_clone = {}
+            for key, value in x_s.items():
+                if isinstance(value, torch.Tensor):
+                    x_s_clone[key] = value.clone()
+                else:
+                    x_s_clone[key] = value
             y_s = batch_s['labels'].to(device)
             if args.text_input:
                 try:
@@ -363,6 +369,9 @@ def main():
                 if args.text_input:
                     z_t, loss_t, acc_t = model(x_t, is_text = True)
                     loss = loss_s + args.text_weight*loss_t
+                    if args.train_with_asr_text:
+                        z_s_t, loss_s_t, acc_s_t = model(x_s_clone, is_text = True)
+                        loss += args.text_weight*loss_s_t
                 else:
                     loss = loss_s
                 
@@ -379,6 +388,9 @@ def main():
             if args.text_input:
                 writer.add_scalar("Loss/text_rain", loss_t, j)
                 writer.add_scalar("Accuracy/text_train", acc_t, j)
+                if args.train_with_asr_text:
+                    writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
+                    writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
             
@@ -479,7 +491,7 @@ def main():
             writer.add_scalar("WER/cer", cer, j)
             for _k, _p in model.named_parameters():
                 if _p.requires_grad:
-                    writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().numpy(), j)            
+                    writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().float().numpy(), j)            
             logging_dict = {
                 'step': j,
                 'train_loss': train_loss,
