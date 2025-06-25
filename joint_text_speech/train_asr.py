@@ -5,6 +5,7 @@ import functools
 import torch
 import tqdm
 import yaml
+import re
 
 import data_asr
 import models_asr
@@ -44,6 +45,8 @@ def lr_lambda(step, args):
         return lr_lambda_linear_with_min_lr(step, args)
     return lr_lambda_cosine_with_min_lr(step, args)
 
+def remove_punctuation(text):
+    return re.sub(r"[^\w\s']|(?<!\w)'|'(?!\w)", "", text).lower()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -153,6 +156,8 @@ def main():
                         help='use text and audio input for training, if False use audio input')
     parser.add_argument('--train_with_asr_text', action='store_true',
                         help='use text input from asr dataset for training, aligned with speech training, if False use text input from text dataset')
+    parser.add_argument('--mse_loss', action='store_true',
+                        help='only use in case asr text is true and text input is true, this will use mse loss between hidden states of text encoder and connector')
     parser.add_argument('--encoder_eval', action='store_true',
                         help='eval mode for encoder during training, if False train mode')
     parser.add_argument('--connector_eval', action='store_true',
@@ -217,7 +222,7 @@ def main():
         tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
         encoder = models_asr.WavLMWrapper(args.encoder_model_name)
         if args.text_input:
-            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), tokenizer = tokenizer)
+            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
             #text_encoder = text_encoder.to(torch.bfloat16)
         connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
         #connector = connector.to(torch.bfloat16)
@@ -280,7 +285,7 @@ def main():
         lr_lambda_partial = functools.partial(lr_lambda, args=args)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
         start_step = 0
-    
+    print("starting from step:" , start_step)
     # Running variables for keeping track of training metrics
     train_loss = 0
     training_acc = 0
@@ -361,17 +366,23 @@ def main():
                 x_t = batch_t
                 y_t = batch_t['labels'].to(device)
 
-
-
             with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                z_s, loss_s, acc_s = model(x_s, is_text = False)
-                
+                z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
                 if args.text_input:
-                    z_t, loss_t, acc_t = model(x_t, is_text = True)
+                    z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
                     loss = loss_s + args.text_weight*loss_t
                     if args.train_with_asr_text:
-                        z_s_t, loss_s_t, acc_s_t = model(x_s_clone, is_text = True)
-                        loss += args.text_weight*loss_s_t
+                        z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
+                        if args.mse_loss:
+                            z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
+                            mse_loss = ((hidden_states_s - hidden_states_t)**2).to(device) #bxNxdims
+                            lengths = x_s_clone['input_len'].to(device)
+                            mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
+                            mse_loss = mse_loss*mask[:, :, None] #bxNxdims
+                            mse_loss = mse_loss.sum() / (mask.sum()*hidden_states_s.shape[-1])
+                            loss += mse_loss
+                        else:
+                            loss += args.text_weight*loss_s_t
                 else:
                     loss = loss_s
                 
@@ -391,6 +402,7 @@ def main():
                 if args.train_with_asr_text:
                     writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
+                    writer.add_scalar("Loss/mse_loss", mse_loss, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
             
@@ -423,7 +435,7 @@ def main():
                     val_y = val_batch['labels'].to(device)
                     #val_z = model(val_x)
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                        z, loss, acc = model(val_x)
+                        z, loss, acc = model(val_x, is_text = False, output_hidden_states=False)
                     #loss = criterion(val_z.permute(0, 2, 1), val_y)
                     val_loss += (loss).mean().item()
                     #acc = ((val_z.argmax(dim=-1) == val_y) * (val_y >= 0)).sum() / (val_y >= 0).sum()
@@ -433,6 +445,8 @@ def main():
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                         text_x = [normalizer(text_str) for text_str in model.generate(val_x, 100, bos_token = bos_token)]
                     text_y = [normalizer(text_str) for text_str in val_batch['text_trans']]
+                    text_x = [remove_punctuation(text_str) for text_str in text_x]
+                    text_y = [remove_punctuation(text_str) for text_str in text_y]
                     all_transcriptions += text_x
                     all_references += text_y
 
@@ -546,7 +560,7 @@ def main():
         if j % args.save_steps == 0:
             model.connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             if args.text_input:
-                model.text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
+                model.text_encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             if args.train_encoder:
                 model.encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))

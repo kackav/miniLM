@@ -165,14 +165,14 @@ class TextEncoder(nn.Module):
                  dim_output,
                  num_heads,
                  ff_size,                 
-                 tokenizer,
+                 pad_token,
                  num_layers = 2,
                  dropout = 0,
                  causal=False
                  ):
         super(TextEncoder, self).__init__()
         self.embedding = nn.Embedding(
-            vocab_size, dim_input, padding_idx=tokenizer.pad_token_id)
+            vocab_size, dim_input, padding_idx=pad_token)
         self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout, causal=causal)
                                      for _ in range(num_layers)])
@@ -188,7 +188,8 @@ class TextEncoder(nn.Module):
             'ff_size': ff_size,
             'num_layers': num_layers,
             'dropout': dropout,
-            'tokenizer': tokenizer.__dict__,
+            'pad_token': pad_token,
+           # 'tokenizer': tokenizer.__dict__,
             'causal': causal,
         }
 
@@ -293,7 +294,6 @@ class Connector(nn.Module):
                 features = features.transpose(1, 2)
                 features = nn.functional.gelu(features)
                 speech_length = (1 + (speech_length - kernel_size) / stride).int()
-            
             input_length = speech_length
             features = features[:, :input_length.max().item(), :]
         else: #TextEncoder output
@@ -347,7 +347,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         for param in self.lm.parameters():
             param.requires_grad = False
 
-    def forward(self, x, is_text = False):
+    def forward(self, x, is_text = False, output_hidden_states=False):
         text, text_lengths = x['input_ids'], x['input_len']
         labels, labels_lengths = x['labels'], x['labels_len']
         if self.printing:
@@ -387,7 +387,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         text_mask = torch.ones(text_embedding.shape[0], text_embedding.shape[1], device=connector_output.device, dtype=torch.bool)
         full_mask = torch.cat((connector_mask, text_mask), dim=1)
 
-        lm_outputs = self.lm(inputs_embeds = full_embedding, attention_mask=full_mask)
+        lm_outputs = self.lm(inputs_embeds = full_embedding, attention_mask=full_mask, output_hidden_states=output_hidden_states)
         logits = lm_outputs['logits']
         if self.printing:
             print(f'logits shape:{logits.shape}')
@@ -396,7 +396,14 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         loss = self.criterion(y_logits.transpose(1, -1), labels)
         accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
         self.printing = False
-        return y_logits, loss, accuracy
+
+        if not(output_hidden_states):
+            return y_logits, loss, accuracy
+        
+        sliced = [layer[:, -labels.shape[1]:, :] for layer in lm_outputs['hidden_states']]
+        hidden_states = torch.cat(sliced, dim = -1)
+        
+        return y_logits, loss, accuracy, hidden_states
 
     def generate(self, x, max_len, bos_token):  # 100 maxlen
         batch_size = x['audio'].shape[0]
@@ -455,4 +462,3 @@ def separate_two_sequences(x, x_lengths, z_lengths):
         z[i, :z_lengths[i]] = x[i, :z_lengths[i]]
         y[i, :y_lengths[i]] = x[i, z_lengths[i]:z_lengths[i] + y_lengths[i]]
     return z, y, z_lengths, x_lengths
-

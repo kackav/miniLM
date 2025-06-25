@@ -385,7 +385,7 @@ def main():
                         #print(mask[0])
                         mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                         #print("new mse loss", mse_loss)
-                        mse_loss = mse_loss.sum() / mask.sum()
+                        mse_loss = mse_loss.sum() / (mask.sum()*hidden_states_s.shape[-1])
                         loss += mse_loss
                 else:
                     loss = loss_s
