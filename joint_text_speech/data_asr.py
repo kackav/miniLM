@@ -212,17 +212,18 @@ def load_from_config(ds_type, path):
     for k,v in config_datasets[ds_type].items():
         dataset_path = os.path.join(hf_dataset_path, f"prep_{k}_{ds_type}")
         if os.path.exists(dataset_path):
+            print(f"loading prepared dataset {k} from {dataset_path}")
             loaded_datasets[k] = datasets.load_from_disk(dataset_path)
-            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=12)
+            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=2)
 
         else:
-            print("prepared dataset not found on hub, filtering original dataset")
+            print(f"prepared dataset not found {k} in {dataset_path}, filtering original dataset")
             if len(v.split(":")[1]) == 0:
                 loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], split = v.split(":")[2], trust_remote_code=True)
             else:
                 loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], v.split(":")[1], split = v.split(":")[2], trust_remote_code=True)
             if 'audio' in loaded_datasets[k].features:
-                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio'].shape[1]<(30*16_000), num_proc=12)          
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio'].shape[1]<(30*16_000), num_proc=2)          
         
     return loaded_datasets
 

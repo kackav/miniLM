@@ -1,6 +1,8 @@
 import os
 import argparse
 import functools
+import time
+import datetime
 
 import torch
 import tqdm
@@ -195,6 +197,9 @@ def main():
 
     bos_token = args.bos_token
     lm_model_name = args.lm_model_name
+    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map=accelerator.device)
+    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+
     for arg in vars(args):
         accelerator.print(f'{arg}: {getattr(args, arg)}')
     if args.resume:
@@ -232,9 +237,9 @@ def main():
             encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
         else:
             encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-            if hasattr(encoder, 'masked_spec_embed'):
-                encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
-            connector = models_asr.Connector(encoder.encoder.config.hidden_size, args.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
+            connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
+        # if hasattr(encoder, 'masked_spec_embed'):
+        #     encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
         if args.text_input:
             text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
             #text_encoder = text_encoder.to(torch.bfloat16)
@@ -256,8 +261,6 @@ def main():
         dset_train_t = data_asr.load_from_config('text_train', args.datasets_config)
         train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
 
-    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', ) #device_map='auto')
-    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
     
     if args.text_input:
         model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
@@ -431,6 +434,8 @@ def main():
                                     loss += args.text_weight*loss_s_t
                         else:
                             loss = loss_s
+                    (loss/args.accumulation_steps).backward()
+            
             else:
                 with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                     z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
@@ -451,8 +456,9 @@ def main():
                                 loss += args.text_weight*loss_s_t
                     else:
                         loss = loss_s
+                
+                (loss/args.accumulation_steps).backward()
                     
-            (loss/args.accumulation_steps).backward()
             train_loss += loss
                 # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
             training_acc += acc_s
@@ -476,6 +482,13 @@ def main():
 
                 # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
 
+        if not args.generate:
+            # clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+            # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
         if accelerator.is_main_process and not(args.generate):
             writer.add_scalar("Loss/train", loss_s, j)
@@ -492,16 +505,13 @@ def main():
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
-
-            # clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-            # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
             writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+
+
+            
 
         if j > 0 and j % args.validation_steps == 0:
+            start_time = time.time()
             model.eval()
             for ds_name, val_dataset_loader in validation_loaders.items():
                 with torch.no_grad():
@@ -544,9 +554,15 @@ def main():
                 num_words = sum(len(t.split()) for t in all_transcriptions)
                 num_chars = sum(len(t) for t in all_transcriptions)
 
-                metrics = torch.tensor([insertions, deletions, substitutions, wer, cer, num_words, num_chars], device=device)
+                metrics = torch.tensor([insertions, deletions, substitutions, wer * num_words, cer * num_chars, num_words, num_chars], device=device)
+                current_time = time.time()
+                performance = (current_time - start_time) / 60  # in minutes
+                print(f"Validation on {ds_name} ended at {datetime.datetime.now()} for process {accelerator.process_index}, took {performance:.2f} minutes")
+                accelerator.wait_for_everyone()
                 metrics = accelerator.reduce(metrics, reduction='sum')
                 insertions, deletions, substitutions, wer, cer, num_words, num_chars = metrics.tolist()
+                wer = wer / num_words
+                cer = cer / num_chars
 
                 if accelerator.is_main_process:
                     accelerator.print(ds_name)

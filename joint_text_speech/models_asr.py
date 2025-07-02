@@ -64,12 +64,12 @@ class SelfAttention(nn.Module):
         return x
 
 class WavLMWrapper(nn.Module): 
-    def __init__(self, model_name="microsoft/wavlm-large"):
+    def __init__(self, model_name="microsoft/wavlm-large", deactivate_masked_spec_embed=True):
         super().__init__()
         self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         self.encoder.config.mask_feature_prob = 0.0
-        # if hasattr(self.encoder, 'masked_spec_embed'):
-        #     self.encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
+        if hasattr(self.encoder, 'masked_spec_embed') and deactivate_masked_spec_embed:
+            self.encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
         self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
         self.kernel_sizes = [_.conv.kernel_size[0] for _ in self.encoder.feature_extractor.conv_layers]
         self.config = {
@@ -103,10 +103,10 @@ class WavLMWrapper(nn.Module):
     def load_from_dir(cls, output_dir, device=None):
         with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-        model = cls(**config)
+        model = cls(**config, deactivate_masked_spec_embed=False)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
         if hasattr(model.encoder, 'masked_spec_embed'):
-            model.masked_spec_embed = None
+            model.encoder.masked_spec_embed = None
         return model
 
 
