@@ -68,6 +68,8 @@ class WavLMWrapper(nn.Module):
         super().__init__()
         self.encoder = transformers.WavLMModel.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         self.encoder.config.mask_feature_prob = 0.0
+        # if hasattr(self.encoder, 'masked_spec_embed'):
+        #     self.encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
         self.strides = [_.conv.stride[0] for _ in self.encoder.feature_extractor.conv_layers]
         self.kernel_sizes = [_.conv.kernel_size[0] for _ in self.encoder.feature_extractor.conv_layers]
         self.config = {
@@ -103,6 +105,8 @@ class WavLMWrapper(nn.Module):
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(**config)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
+        if hasattr(model.encoder, 'masked_spec_embed'):
+            model.masked_spec_embed = None
         return model
 
 

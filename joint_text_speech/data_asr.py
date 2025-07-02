@@ -4,11 +4,14 @@ import requests
 
 import torch
 import torchaudio
+import librosa
+import soundfile
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.decoders import BPEDecoder
-
+import datasets
+import yaml
 
 def train_bpe(data, vocab_size=1024, special_tokens=None, output_dir='tokenizer', num_sentences=100000):
     if special_tokens is None:
@@ -97,6 +100,132 @@ class AudioDataset(torch.utils.data.Dataset):
     def __iter__(self):
         for i in range(len(self.data)):
             yield self[i]
+
+class TextDatasetHF(torch.utils.data.Dataset):
+    def __init__(self, data, tokenizer, bos_token):
+        self.data = data
+        self.data_lengths = {key: len(v) for key,v in data.items()}
+        self.tokenizer = tokenizer
+        if bos_token is None:
+            self.bos_token = [self.tokenizer.eos_token_id]
+        else:
+            self.bos_token = self.tokenizer.encode(bos_token)
+
+    def __len__(self):
+        return sum(list(self.data_lengths.values()))
+
+    def __getitem__(self, idx):
+        total_length = 0
+        for key, length in self.data_lengths.items():
+            previous_length = total_length
+            total_length += length
+            if idx < total_length:
+                idx -= previous_length
+                break
+
+        data_key = self.data[key][idx]
+        text = data_key['text'].lower()
+        # cut text to max 230 characters
+        if len(text) > 230:
+            text = text[:230]
+        inp = text
+        label = text
+        return {"text_trans" : text,
+                "input_ids" : self.bos_token + self.tokenizer.encode(inp),
+                "input_len" : len(self.tokenizer.encode(inp)) + 1,
+                "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
+                "labels_len" : len(self.tokenizer.encode(label)) + 1
+                }
+
+class AudioDatasetHF(torch.utils.data.Dataset):
+    def __init__(self, data, tokenizer, bos_token):
+        self.data = data
+        self.is_fake = False
+        self.fake_audio_len = 0.0001
+        self.fake_text_len = 1
+        
+        #librispeech: iterable(dataset), ...
+        self.data_lengths ={k: len(v) for k,v in data.items()}
+        # self.cumulative_lengths = torch.sum(self.data_lengths)
+        # print(self.cumulative_lengths)
+        self.tokenizer = tokenizer
+        if bos_token is None:
+            self.bos = [self.tokenizer.eos_token_id]
+        else:
+            self.bos = self.tokenizer.encode(bos_token)
+
+    def __len__(self):
+        #print(self.data_lengths.values())
+        return sum(list(self.data_lengths.values()))
+    
+    def __getitem__(self, idx):
+        if self.is_fake:
+            text = "This is a fake text for resume."
+            audio = torch.zeros(int(self.fake_audio_len * 16000))  # shape (1, fake_audio_len * fs)
+            audio = audio.unsqueeze(0)  # add channel dimension
+            inp = [0] * self.fake_text_len
+            label = [0] * self.fake_text_len
+            return {"audio": audio,
+                "audio_len": audio.shape[1],
+                "text_trans": text,
+                "input_ids": inp,
+                "input_len": self.fake_text_len,
+                "labels": label,
+                "labels_len" : self.fake_text_len
+                }
+        
+
+        #print(f"__getitem__ called with idx={idx}")
+        #print(self.data_lengths)
+        total_length = 0
+        for key, length in self.data_lengths.items():
+            previous_length = total_length
+            total_length += length
+            if idx < total_length:
+                idx -= previous_length
+                break
+
+         #librispeech data structure - if dataset doesn't have it, prep it according to commonvoice_prep.py
+        data_key = self.data[key][idx]
+        text = data_key['text'].lower()
+        audio_path = data_key['audio']['path']
+        audio = torch.tensor(data_key['audio']['array'], dtype=torch.float32)
+        audio = audio.unsqueeze(0)  # add channel dimension
+        inp = text
+        label = text
+        
+        return {"audio" : audio,
+                "audio_len" : audio.shape[1],
+                "text_trans" : text,
+                "input_ids" : self.bos + self.tokenizer.encode(inp),
+                "input_len" : len(self.tokenizer.encode(inp)) + 1,
+                "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
+                "labels_len" : len(self.tokenizer.encode(label)) + 1
+                }
+        
+
+def load_from_config(ds_type, path):
+    with open(path, 'r') as f:
+        config_datasets = yaml.load(f, Loader=yaml.FullLoader)
+    loaded_datasets = {}
+    hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
+    for k,v in config_datasets[ds_type].items():
+        dataset_path = os.path.join(hf_dataset_path, f"prep_{k}_{ds_type}")
+        if os.path.exists(dataset_path):
+            loaded_datasets[k] = datasets.load_from_disk(dataset_path)
+            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=12)
+
+        else:
+            print("prepared dataset not found on hub, filtering original dataset")
+            if len(v.split(":")[1]) == 0:
+                loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], split = v.split(":")[2], trust_remote_code=True)
+            else:
+                loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], v.split(":")[1], split = v.split(":")[2], trust_remote_code=True)
+            if 'audio' in loaded_datasets[k].features:
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio'].shape[1]<(30*16_000), num_proc=12)          
+        
+    return loaded_datasets
+
 
 def collate_fn_asr(batch, tokenizer=None):
     audio = [_['audio'][0] for _ in batch]
