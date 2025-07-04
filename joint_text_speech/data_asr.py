@@ -210,6 +210,7 @@ class AudioDatasetHF(torch.utils.data.Dataset):
 def load_from_config(ds_type, path):
     with open(path, 'r') as f:
         config_datasets = yaml.load(f, Loader=yaml.FullLoader)
+        
     loaded_datasets = {}
     hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
     for k,v in config_datasets[ds_type].items():

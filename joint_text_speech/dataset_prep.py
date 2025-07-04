@@ -58,9 +58,9 @@ def generate_dataset(shards, ds_type, ds_text_column, normalizer=None):
             }
 
 def main():
-    path = "/mnt/matylda6/ivendrame/wavlm_connector_lm/notebooks/auxiliary_joint_text_speech/"
+    path = "/mnt/matylda6/ivendrame/wavlm_connector_lm/scripts/joint_text_speech/"
     dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
-    splits = ["validation"]
+    splits = ["train"]
     num_proc = 4
     normalizer = EnglishSpellingNormalizer()
 

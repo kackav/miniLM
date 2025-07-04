@@ -1,0 +1,31 @@
+train:
+  commonvoice:
+    name: mozilla-foundation/common_voice_17_0:en
+    split: train
+    text_column: normalized_text
+  # librispeech_clean: 
+  #   name : librispeech_asr:clean
+  #   split: train.100
+  #   text_column: text
+validation:
+  #librispeech_dev_clean: librispeech_asr:clean:validation
+  #librispeech_dev_other: librispeech_asr:other:validation
+  librispeech_dev_clean: 
+    name: librispeech_asr:clean
+    split: validation
+    text_column: text
+  # librispeech_dev_other: 
+  #   name: librispeech_asr:other
+  #   split: validation
+  #   text_column: text
+  # commonvoice: 
+  #   name: mozilla-foundation/common_voice_17_0:en
+  #   split: validation
+  #   text_column: normalized_text
+
+text_train:
+  librispeech_lm: 
+    name: librispeech_lm
+    split: train
+    text_column: text
+  #wikipedia: wikimedia/wikipedia:20231101.en:train
