@@ -16,7 +16,6 @@ from safe_gpu import safe_gpu
 import jiwer
 from torch.utils.tensorboard import SummaryWriter
 import transformers
-from whisper_normalizer.english import EnglishSpellingNormalizer
 import datasets
 import accelerate
 
@@ -53,8 +52,6 @@ def lr_lambda(step, args):
         return lr_lambda_linear_with_min_lr(step, args)
     return lr_lambda_cosine_with_min_lr(step, args)
 
-def remove_punctuation(text):
-    return re.sub(r"[^\w\s']|(?<!\w)'|'(?!\w)", "", text).lower()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -62,8 +59,6 @@ def main():
                         help='name of the experiment')
     parser.add_argument('--no_cuda', action='store_true',
                         help='do not use cuda even if it is available')
-    parser.add_argument('--hidden_size', type=int, default=512,
-                        help='hidden size of transformer model')
     parser.add_argument('--num_heads', type=int, default=16,
                         help='number of attention heads')
     parser.add_argument('--ff_size', type=int, default=2048,
@@ -134,8 +129,6 @@ def main():
                         help='output directory to save model checkpoints and generated outputs')
     parser.add_argument('--resume', action='store_true',
                         help='resume training from latest')
-    parser.add_argument('--generate', action='store_true',
-                        help='generate from latest')
 
     parser.add_argument('--log_dir', type=str, default=None,
                         help='log runs dir')
@@ -184,7 +177,6 @@ def main():
 
     def place_holder_fn(x):
         pass
-    # safe_gpu.claim_gpus(4, placeholder_fn=place_holder_fn)
 
     accelerator = accelerate.Accelerator()
     print("CUDA_VISIBLE_DEVICES:", os.environ.get('CUDA_VISIBLE_DEVICES', ''))
@@ -194,14 +186,22 @@ def main():
     device = accelerator.device
     print(f'Using device: {device} - index: {accelerator.process_index}')
 
+    if accelerator.is_main_process:
+        writer = SummaryWriter(log_dir=args.log_dir)
+    else:
+        writer = None
+    for arg in vars(args):
+        accelerator.print(f'{arg}: {getattr(args, arg)}')
 
+
+    ## MODEL
     bos_token = args.bos_token
     lm_model_name = args.lm_model_name
     lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map=accelerator.device)
-    #lm = models_asr.Transformer.load_from_dir(args.lm_dir, device)
+    lm_config = {"model_name": lm_model_name,
+                 "bos_token": bos_token if bos_token is not None else lm.config.eos_token_id}
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
 
-    for arg in vars(args):
-        accelerator.print(f'{arg}: {getattr(args, arg)}')
     if args.resume:
         accelerator.print('Resuming from checkpoint')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
@@ -220,48 +220,23 @@ def main():
                 lm_config = yaml.load(f, Loader=yaml.FullLoader)
             lm_model_name = lm_config['model_name']
             bos_token = lm_config['bos_token']
-        else:
-            lm_model_name = args.lm_model_name
-            bos_token = args.bos_token
-        tokenizer = transformers.AutoTokenizer.from_pretrained(lm_model_name, trust_remote_code=True)
         
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
     
+    if args.pretrained_dir is not None:
+        accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
+        connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
+        encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
     else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
-        if args.pretrained_dir is not None:
-            accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
-            connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
-            encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
-        else:
-            encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-            connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
-        # if hasattr(encoder, 'masked_spec_embed'):
-        #     encoder.masked_spec_embed = None  # Disable masked spec embedding if it exists
-        if args.text_input:
-            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
-            #text_encoder = text_encoder.to(torch.bfloat16)
-        #connector = connector.to(torch.bfloat16)
-    
-    for arg in vars(args):
-        accelerator.print(f'{arg}: {getattr(args, arg)}')
-
-    # datasets
-    # validation (dict of datasets)
-    dset_valid = data_asr.load_from_config('validation', args.datasets_config) # dictonary ["commonvoice": ..., "librispeech": ... etc]
-    val_subsets = {}
-    for k, v in dset_valid.items():
-        val_subsets[k] = data_asr.AudioDatasetHF({k:v}, tokenizer, bos_token)
-    
-    dset_train_s = data_asr.load_from_config('train', args.datasets_config)
-    train_asr_data = data_asr.AudioDatasetHF(dset_train_s, tokenizer, bos_token)
+        encoder = models_asr.WavLMWrapper(args.encoder_model_name)
+        connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     if args.text_input:
-        dset_train_t = data_asr.load_from_config('text_train', args.datasets_config)
-        train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
-
-    
+        text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
+        
+    #connector = connector.to(torch.bfloat16)
+    #text_encoder = text_encoder.to(torch.bfloat16)
     if args.text_input:
         model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
     else:
@@ -273,6 +248,7 @@ def main():
     if not args.train_lm:
         model.freeze_lm()
 
+    # parameters
     parameters_to_train = list(model.connector.parameters())
     if args.text_input:
         parameters_to_train += list(model.text_encoder.parameters())
@@ -282,11 +258,27 @@ def main():
         parameters_to_train += list(model.lm.parameters())
 
     accelerator.print(model.config)
-    
     accelerator.print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     accelerator.print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
-    # training
+
+    ## DATASETS
+    # validation (dict of datasets)
+    dset_valid = data_asr.load_from_config('validation', args.datasets_config) # dictonary ["commonvoice": ..., "librispeech": ... etc]
+    val_subsets = {}
+    for k, v in dset_valid.items():
+        val_subsets[k] = data_asr.AudioDatasetHF({k:v}, tokenizer, bos_token)
+    # train dataset
+    dset_train_s = data_asr.load_from_config('train', args.datasets_config)
+    train_asr_data = data_asr.AudioDatasetHF(dset_train_s, tokenizer, bos_token)
+    if args.text_input:
+        dset_train_t = data_asr.load_from_config('text_train', args.datasets_config)
+        train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
+    datasets_config = {"speech_train": dset_train_s,
+                          "text_train": dset_train_t if args.text_input else None,
+                          "validation": dset_valid}
+
+    ## Optimizer, scheduler, data loaders
     if args.resume:
         optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
         lr_lambda_partial = functools.partial(lr_lambda, args=args)
@@ -300,22 +292,40 @@ def main():
         lr_lambda_partial = functools.partial(lr_lambda, args=args)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
         start_step = 0
-    
-    # Running variables for keeping track of training metrics
-    train_loss = 0
-    training_acc = 0
-    training_count = 0
-    best_wer = float('inf')
-    all_metrics = []
 
     torch.manual_seed(24)
+    # training dataloader
     collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
     train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_asr,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)
                                           #     drop_last=True)
+     
+    if args.text_input:
+        collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
+        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
+                                               collate_fn=collate_fn_text,
+                                               shuffle=True,
+                                               num_workers=args.dataloader_num_workers)                                    
+    # validation dataloaders    
+    validation_loaders = {}
+    for name, ds in val_subsets.items():
+        validation_loader = torch.utils.data.DataLoader(ds, batch_size=args.per_device_eval_batch_size,
+                                                    collate_fn=collate_fn_asr,
+                                                    num_workers=args.dataloader_num_workers)
+        validation_loaders[name] = validation_loader
+
+    # accelerator preparation
+    model, optimizer, train_asr_loader, train_text_loader = accelerator.prepare(
+        model, optimizer, train_asr_loader, train_text_loader
+    )
+    for k, v in validation_loaders.items():
+        validation_loaders[k] = accelerator.prepare(v)
+
+    train_text_loader_iter = iter(train_text_loader)
     train_asr_loader_iter = iter(train_asr_loader)
+
     if args.resume:
         train_asr_loader.dataset.is_fake = True
         train_asr_loader_iter = iter(train_asr_loader)
@@ -331,36 +341,15 @@ def main():
                     break
             if found:
                 break
-     
-    if args.text_input:
-        collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
     
-        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
-                                               collate_fn=collate_fn_text,
-                                               shuffle=True,
-                                               num_workers=args.dataloader_num_workers)                                    
-        train_text_loader_iter = iter(train_text_loader)
-    
-    validation_loaders = {}
-    for name, ds in val_subsets.items():
-        validation_loader = torch.utils.data.DataLoader(ds, batch_size=args.per_device_eval_batch_size,
-                                                    collate_fn=collate_fn_asr,
-                                                    num_workers=args.dataloader_num_workers)
-        validation_loaders[name] = validation_loader
-    accelerator.print(validation_loaders)
 
-    model, optimizer, train_asr_loader, train_text_loader = accelerator.prepare(
-        model, optimizer, train_asr_loader, train_text_loader
-    )
-    for k, v in validation_loaders.items():
-        validation_loaders[k] = accelerator.prepare(v)
-
-    normalizer = EnglishSpellingNormalizer()
-
-    if accelerator.is_main_process:
-        writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        writer = None
+    ## TRAINING LOOP
+    accelerator.print(f'Starting step: {start_step}, max steps: {args.max_steps}')
+    train_loss = 0
+    training_acc = 0
+    training_count = 0
+    best_wer = float('inf')
+    all_metrics = []
 
     for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1), disable=not accelerator.is_main_process):
         optimizer.zero_grad()
@@ -381,10 +370,9 @@ def main():
                 accelerator.unwrap_model(model).text_encoder.eval()
             else:
                 accelerator.unwrap_model(model).text_encoder.train()
-
+        
+        ## ACCUMULATION STEPS
         for k in range(args.accumulation_steps):
-            if args.generate:
-                break
             try:
                 batch_s = next(train_asr_loader_iter)
             except StopIteration:
@@ -458,39 +446,33 @@ def main():
                         loss = loss_s
                 
                 (loss/args.accumulation_steps).backward()
-                    
-            train_loss += loss
-                # acc = ((z.argmax(dim=-1) == y) * (y >= 0) ).sum() / (y >= 0).sum()
-            training_acc += acc_s
-            training_count += 1
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        if not args.generate:
-            loss_s = accelerator.gather(loss_s).mean().item()
-            acc_s = accelerator.gather(acc_s).mean().item()
-            loss = accelerator.gather(loss).mean().item()
-            if args.text_input:
-                loss_t = accelerator.gather(loss_t).mean().item()
-                acc_t = accelerator.gather(acc_t).mean().item()
-                if args.train_with_asr_text:
-                    loss_s_t = accelerator.gather(loss_s_t).mean().item()
-                    acc_s_t = accelerator.gather(acc_s_t).mean().item()
+        loss_s = accelerator.gather(loss_s).mean().item()
+        acc_s = accelerator.gather(acc_s).mean().item()
+        loss = accelerator.gather(loss).mean().item()
+        if args.text_input:
+            loss_t = accelerator.gather(loss_t).mean().item()
+            acc_t = accelerator.gather(acc_t).mean().item()
+            if args.train_with_asr_text:
+                loss_s_t = accelerator.gather(loss_s_t).mean().item()
+                acc_s_t = accelerator.gather(acc_s_t).mean().item()
+                if args.mse_loss:
                     mse_loss = accelerator.gather(mse_loss).mean().item()
-                else:
-                    loss_s_t = None
-                    acc_s_t = None
-                    mse_loss = None
+            else:
+                loss_s_t = None
+                acc_s_t = None
+                mse_loss = None
 
-                # optimizer.param_groups[0]['lr'] = scheduler.get_last_lr()[0]
+        train_loss += loss
+        training_acc += acc_s
+        training_count += 1
 
-        if not args.generate:
-            # clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
-            # torch.nn.utils.clip_grad_value_(model.parameters(), args.max_grad_value)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-
-        if accelerator.is_main_process and not(args.generate):
+        # Log training metrics
+        if accelerator.is_main_process:
             writer.add_scalar("Loss/train", loss_s, j)
             if args.text_input:
                 writer.add_scalar("Loss/text_rain", loss_t, j)
@@ -498,7 +480,8 @@ def main():
                 if args.train_with_asr_text:
                     writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
-                    writer.add_scalar("Loss/mse_loss", mse_loss, j)
+                    if args.mse_loss:
+                        writer.add_scalar("Loss/mse_loss", mse_loss, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
             
@@ -507,9 +490,7 @@ def main():
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
             writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
 
-
-            
-
+        ## VALIDATION LOOP
         if j > 0 and j % args.validation_steps == 0:
             start_time = time.time()
             model.eval()
@@ -526,22 +507,18 @@ def main():
                         for key, value in val_x.items():
                             if isinstance(value, torch.Tensor):
                                 val_x[key] = val_x[key].to(device)
-                        
                         val_y = val_batch['labels'].to(device)
-                        #val_z = model(val_x)
+
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             z, loss, acc = model(val_x, is_text = False, output_hidden_states=False)
-                        #loss = criterion(val_z.permute(0, 2, 1), val_y)
                         val_loss += (loss).mean().item()
-                        #acc = ((val_z.argmax(dim=-1) == val_y) * (val_y >= 0)).sum() / (val_y >= 0).sum()
                         val_acc += acc.mean().item()
                         val_count += 1
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                            text_x = [normalizer(text_str) for text_str in accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)]
-                        text_y = [normalizer(text_str) for text_str in val_batch['text_trans']]
-                        text_x = [remove_punctuation(text_str) for text_str in text_x]
-                        text_y = [remove_punctuation(text_str) for text_str in text_y]
+                            text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
+                        text_y = val_batch['text_trans']
+
                         all_transcriptions += text_x
                         all_references += text_y
 
@@ -564,6 +541,7 @@ def main():
                 wer = wer / num_words
                 cer = cer / num_chars
 
+                # Log validation metrics
                 if accelerator.is_main_process:
                     accelerator.print(ds_name)
                     accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
@@ -587,20 +565,6 @@ def main():
                     writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
                     writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
                     writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
-
-                    
-                    if args.generate:
-                        logging_dict = {
-                        'step': j,
-                        'dataset' : ds_name,
-                        'val_loss': val_loss,
-                        'val_acc': val_acc,
-                        'wer' : wer,
-                        }
-                        accelerator.print(logging_dict)
-                        yaml.dump(logging_dict, open(os.path.join(args.output_dir, 'latest', 'val_metrics.yaml'), 'w'))
-                        writer.flush()
-                        os._exit(0)
 
             train_loss = train_loss / training_count
             training_acc = training_acc / training_count
@@ -630,16 +594,7 @@ def main():
                     accelerator.unwrap_model(model).text_encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
                 if args.train_encoder:
                     accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
-
-                lm_config = {
-                    'model_name' : lm_model_name,
-                    'bos_token' : bos_token,
-                    }
-                with open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w') as f:
-                    yaml.dump(lm_config, f)
-        
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
-
 
                 # save otpimizer state
                 torch.save(optimizer.state_dict(), os.path.join(args.output_dir, 'latest', 'optimizer.pt'))
@@ -667,7 +622,9 @@ def main():
             if args.train_encoder:
                 accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
-    
+            yaml.dump(lm_config, open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w'))
+            yaml.dump(datasets_config, open(os.path.join(args.output_dir, 'datasets_config.yaml'), 'w'))
+
         if accelerator.is_main_process:
             writer.flush()
             

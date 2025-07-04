@@ -185,11 +185,14 @@ class AudioDatasetHF(torch.utils.data.Dataset):
                 idx -= previous_length
                 break
 
-         #librispeech data structure - if dataset doesn't have it, prep it according to commonvoice_prep.py
+         #normalized data structure - if dataset doesn't have it, prep it according to commonvoice_prep.py
         data_key = self.data[key][idx]
-        text = data_key['text'].lower()
+        text = data_key['normalized_text'] if "normalized_text" in data_key else data_key["text"].lower()
         audio_path = data_key['audio']['path']
         audio = torch.tensor(data_key['audio']['array'], dtype=torch.float32)
+        sample_rate = data_key['audio']['sampling_rate']
+        if sample_rate != 16000:
+            audio = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(audio)        
         audio = audio.unsqueeze(0)  # add channel dimension
         inp = text
         label = text
@@ -217,11 +220,17 @@ def load_from_config(ds_type, path):
             loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=2)
 
         else:
-            print(f"prepared dataset not found {k} in {dataset_path}, filtering original dataset")
-            if len(v.split(":")[1]) == 0:
-                loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], split = v.split(":")[2], trust_remote_code=True)
+            print(f"prepared dataset not found {k} in {dataset_path}, taking original dataset")
+ 
+            ds_name = v["name"].split(":")[0] if ":" in v["name"] else v["name"]
+            ds_subset = v["name"].split(":")[1] if ":" in v["name"] else None
+            ds_split = v["split"]
+            ds_text_column = v["text_column"]
+            if ds_subset:
+                loaded_datasets[k] = datasets.load_dataset(ds_name, ds_subset, split = ds_split, trust_remote_code=True, num_proc=2)
             else:
-                loaded_datasets[k] = datasets.load_dataset(v.split(":")[0], v.split(":")[1], split = v.split(":")[2], trust_remote_code=True)
+                loaded_datasets[k] = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=2)
+
             if 'audio' in loaded_datasets[k].features:
                 loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio'].shape[1]<(30*16_000), num_proc=2)          
         
