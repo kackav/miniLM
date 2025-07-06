@@ -322,10 +322,11 @@ def main():
     )
     for k, v in validation_loaders.items():
         validation_loaders[k] = accelerator.prepare(v)
-
+    train_asr_loader.dataset.is_fake = True
     train_text_loader_iter = iter(train_text_loader)
     train_asr_loader_iter = iter(train_asr_loader)
-
+    
+    
     if args.resume:
         train_asr_loader.dataset.is_fake = True
         train_asr_loader_iter = iter(train_asr_loader)
@@ -494,12 +495,6 @@ def main():
         if j > 0 and j % args.validation_steps == 0:
             start_time = time.time()
             model.eval()
-            train_loss = train_loss / training_count
-            training_acc = training_acc / training_count
-            if accelerator.is_main_process:
-                for _k, _p in accelerator.unwrap_model(model).named_parameters():
-                    if _p.requires_grad:
-                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().float().numpy(), j)            
             for ds_name, val_dataset_loader in validation_loaders.items():
                 with torch.no_grad():
                     val_loss = 0
@@ -517,75 +512,79 @@ def main():
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             z, loss, acc = model(val_x, is_text = False, output_hidden_states=False)
-                        val_loss += accelerator.gather(loss).mean().item()
-                        val_acc += accelerator.gather(acc).mean().item()
+                        val_loss += (loss).mean().item()
+                        val_acc += acc.mean().item()
                         val_count += 1
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
                         text_y = val_batch['text_trans']
-                        print(text_x)
-                        print(text_y)
+
                         all_transcriptions += text_x
                         all_references += text_y
+
+                output_wer = jiwer.process_words(all_references, all_transcriptions)
+                insertions = output_wer.insertions
+                deletions = output_wer.deletions
+                substitutions = output_wer.substitutions
+                wer = output_wer.wer
+                cer = jiwer.cer(all_references, all_transcriptions)
+                num_words = sum(len(t.split()) for t in all_transcriptions)
+                num_chars = sum(len(t) for t in all_transcriptions)
+
+                metrics = torch.tensor([insertions, deletions, substitutions, wer * num_words, cer * num_chars, num_words, num_chars], device=device)
+                current_time = time.time()
+                performance = (current_time - start_time) / 60  # in minutes
+                print(f"Validation on {ds_name} ended at {datetime.datetime.now()} for process {accelerator.process_index}, took {performance:.2f} minutes")
+                accelerator.wait_for_everyone()
+                metrics = accelerator.reduce(metrics, reduction='sum')
+                insertions, deletions, substitutions, wer, cer, num_words, num_chars = metrics.tolist()
+                wer = wer / num_words
+                cer = cer / num_chars
+
+                # Log validation metrics
+                if accelerator.is_main_process:
+                    accelerator.print(ds_name)
+                    accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
+                
+                    full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
+                    #full_trt = sorted(full_trt, key=lambda x: x[0])
+                    to_write = full_trt[:50]
+                    to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
+                    # Prepend header
+                    to_write = ['| Reference | Transcription |\n',
+                    '|------------|---------------|\n'] + to_write
+                    to_write = ''.join(to_write)
+                    writer.add_text('WER', to_write, j)
+                    #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
                     val_loss = val_loss / val_count
-                    val_acc = val_acc / val_count    
-                    output_wer = jiwer.process_words(all_references, all_transcriptions)
-                    insertions = output_wer.insertions
-                    deletions = output_wer.deletions
-                    substitutions = output_wer.substitutions
-                    wer = output_wer.wer
-                    cer = jiwer.cer(all_references, all_transcriptions)
-                    num_words = sum(len(t.split()) for t in all_transcriptions)
-                    num_chars = sum(len(t) for t in all_transcriptions)
+                    writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)
+                    val_acc = val_acc / val_count                         
+                    writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
+                    writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
+                    writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
+                    writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
+                    writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
+                    writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
 
-                    metrics = torch.tensor([insertions, deletions, substitutions, wer * num_words, cer * num_chars, num_words, num_chars], device=device)
-                    current_time = time.time()
-                    performance = (current_time - start_time) / 60  # in minutes
-                    print(f"Validation on {ds_name} ended at {datetime.datetime.now()} for process {accelerator.process_index}, took {performance:.2f} minutes")
-                    accelerator.wait_for_everyone()
-                    metrics = accelerator.reduce(metrics, reduction='sum')
-                    insertions, deletions, substitutions, wer, cer, num_words, num_chars = metrics.tolist()
-                    wer = wer / num_words
-                    cer = cer / num_chars
-
-                    # Log validation metrics
-                    if accelerator.is_main_process:
-                        accelerator.print(ds_name)
-                        accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
-                    
-                full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
-                #full_trt = sorted(full_trt, key=lambda x: x[0])
-                to_write = full_trt[:50]
-                to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
-                # Prepend header
-                to_write = ['| Reference | Transcription |\n',
-                '|------------|---------------|\n'] + to_write
-                to_write = ''.join(to_write)
-                writer.add_text('WER', to_write, j)
-                #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
-
-                writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
-                writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
-                writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
-                writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
-                writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
-                writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
-                writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
-
-
-                logging_dict = {
-                    'step': j,
-                    'dataset' : ds_name,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'train_acc': training_acc,
-                    'val_acc': val_acc,
-                    'wer' : wer,
-                    'learning_rate': optimizer.param_groups[0]['lr'],
-                    }
-                all_metrics.append(logging_dict)
-                accelerator.print(logging_dict)
+            train_loss = train_loss / training_count
+            training_acc = training_acc / training_count
+            if accelerator.is_main_process:
+                for _k, _p in accelerator.unwrap_model(model).named_parameters():
+                    if _p.requires_grad:
+                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().float().numpy(), j)            
+            logging_dict = {
+                'step': j,
+                'dataset' : ds_name,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_acc': training_acc,
+                'val_acc': val_acc,
+                'wer' : wer,
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                }
+            all_metrics.append(logging_dict)
+            accelerator.print(logging_dict)
             train_loss = 0
             training_acc = 0
             training_count = 0

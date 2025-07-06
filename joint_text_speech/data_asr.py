@@ -141,8 +141,8 @@ class AudioDatasetHF(torch.utils.data.Dataset):
     def __init__(self, data, tokenizer, bos_token):
         self.data = data
         self.is_fake = False
-        self.fake_audio_len = 0.0001
-        self.fake_text_len = 1
+        self.fake_audio_len = 30
+        self.fake_text_len = 230
         
         #librispeech: iterable(dataset), ...
         self.data_lengths ={k: len(v) for k,v in data.items()}
@@ -187,7 +187,7 @@ class AudioDatasetHF(torch.utils.data.Dataset):
 
          #normalized data structure - if dataset doesn't have it, prep it according to commonvoice_prep.py
         data_key = self.data[key][idx]
-        text = data_key['normalized_text'] if "normalized_text" in data_key else data_key["text"].lower()
+        text = data_key['normalized_text'] #if "normalized_text" in data_key else data_key["text"].lower()
         audio_path = data_key['audio']['path']
         audio = torch.tensor(data_key['audio']['array'], dtype=torch.float32)
         sample_rate = data_key['audio']['sampling_rate']
@@ -218,7 +218,7 @@ def load_from_config(ds_type, path):
         if os.path.exists(dataset_path):
             print(f"loading prepared dataset {k} from {dataset_path}")
             loaded_datasets[k] = datasets.load_from_disk(dataset_path)
-            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=2)
+            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=4)
 
         else:
             print(f"prepared dataset not found {k} in {dataset_path}, taking original dataset")
@@ -233,7 +233,7 @@ def load_from_config(ds_type, path):
                 loaded_datasets[k] = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=2)
 
             if 'audio' in loaded_datasets[k].features:
-                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio'].shape[1]<(30*16_000), num_proc=2)          
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: len(item['audio']["array"])<(30*16_000), num_proc=4)          
         
     return loaded_datasets
 

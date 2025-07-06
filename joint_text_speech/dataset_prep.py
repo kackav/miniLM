@@ -11,8 +11,8 @@ from whisper_normalizer.english import EnglishSpellingNormalizer
 def modify_commonvoice(item, ds_text_column, normalizer=None):
     new_item = {}
     new_item["text"] = item["sentence"]
-    if ds_text_column == "normalized_text":
-        new_item["normalized_text"] = normalize_text(new_item["text"], normalizer=normalizer)
+    #if ds_text_column == "normalized_text":
+    new_item["normalized_text"] = normalize_text(new_item["text"], normalizer=normalizer)
     new_item["audio"] = item["audio"]
     audio = item['audio']['array']
     audio = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)(torch.tensor(audio, dtype=torch.float32))
@@ -52,7 +52,7 @@ def generate_dataset(shards, ds_type, ds_text_column, normalizer=None):
 
             yield {
                 "text": item["text"],            
-                "normalized_text": item["normalized_text"] if "normalized_text" in item else item["text"],
+                "normalized_text": item["normalized_text"],
                 "audio": item["audio"],
                 "audio_len": item["audio_len"]
             }
@@ -60,7 +60,7 @@ def generate_dataset(shards, ds_type, ds_text_column, normalizer=None):
 def main():
     path = "/mnt/matylda6/ivendrame/wavlm_connector_lm/scripts/joint_text_speech/"
     dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
-    splits = ["train"]
+    splits = ["validation"]
     num_proc = 4
     normalizer = EnglishSpellingNormalizer()
 

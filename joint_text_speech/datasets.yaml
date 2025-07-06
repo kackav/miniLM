@@ -14,14 +14,14 @@ validation:
     name: librispeech_asr:clean
     split: validation
     text_column: text
-  # librispeech_dev_other: 
-  #   name: librispeech_asr:other
-  #   split: validation
-  #   text_column: text
-  # commonvoice: 
-  #   name: mozilla-foundation/common_voice_17_0:en
-  #   split: validation
-  #   text_column: normalized_text
+  librispeech_dev_other: 
+    name: librispeech_asr:other
+    split: validation
+    text_column: text
+  commonvoice: 
+    name: mozilla-foundation/common_voice_17_0:en
+    split: validation
+    text_column: normalized_text
 
 text_train:
   librispeech_lm: 
