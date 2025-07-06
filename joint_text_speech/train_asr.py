@@ -562,9 +562,8 @@ def main():
                 to_write = ['| Reference | Transcription |\n',
                 '|------------|---------------|\n'] + to_write
                 to_write = ''.join(to_write)
-                writer.add_text('WER', to_write, j)
+                writer.add_text(f'WER_{ds_name}', to_write, j)
                 #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
-
                 writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
                 writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
                 writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
