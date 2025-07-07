@@ -488,6 +488,7 @@ def main():
             
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
             writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
 

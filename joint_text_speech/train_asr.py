@@ -296,7 +296,7 @@ def main():
     torch.manual_seed(24)
     # training dataloader
     collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_text_batch_size,
+    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_asr_batch_size,
                                                collate_fn=collate_fn_asr,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)
@@ -304,7 +304,7 @@ def main():
      
     if args.text_input:
         collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
-        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
+        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers)                                    
@@ -487,6 +487,7 @@ def main():
             
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
+            writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
             writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
 
@@ -524,8 +525,6 @@ def main():
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
                         text_y = val_batch['text_trans']
-                        print(text_x)
-                        print(text_y)
                         all_transcriptions += text_x
                         all_references += text_y
                     val_loss = val_loss / val_count
@@ -554,37 +553,37 @@ def main():
                         accelerator.print(ds_name)
                         accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
                     
-                full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
-                #full_trt = sorted(full_trt, key=lambda x: x[0])
-                to_write = full_trt[:50]
-                to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
-                # Prepend header
-                to_write = ['| Reference | Transcription |\n',
-                '|------------|---------------|\n'] + to_write
-                to_write = ''.join(to_write)
-                writer.add_text(f'WER_{ds_name}', to_write, j)
-                #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
-                writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
-                writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
-                writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
-                writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
-                writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
-                writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
-                writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
+                        full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
+                        #full_trt = sorted(full_trt, key=lambda x: x[0])
+                        to_write = full_trt[:50]
+                        to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
+                        # Prepend header
+                        to_write = ['| Reference | Transcription |\n',
+                        '|------------|---------------|\n'] + to_write
+                        to_write = ''.join(to_write)
+                        writer.add_text(f'WER_{ds_name}', to_write, j)
+                        #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
+                        writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
+                        writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
+                        writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
+                        writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
+                        writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
+                        writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
+                        writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
 
 
-                logging_dict = {
-                    'step': j,
-                    'dataset' : ds_name,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'train_acc': training_acc,
-                    'val_acc': val_acc,
-                    'wer' : wer,
-                    'learning_rate': optimizer.param_groups[0]['lr'],
-                    }
-                all_metrics.append(logging_dict)
-                accelerator.print(logging_dict)
+                        logging_dict = {
+                            'step': j,
+                            'dataset' : ds_name,
+                            'train_loss': train_loss,
+                            'val_loss': val_loss,
+                            'train_acc': training_acc,
+                            'val_acc': val_acc,
+                            'wer' : wer,
+                            'learning_rate': optimizer.param_groups[0]['lr'],
+                            }
+                        all_metrics.append(logging_dict)
+                        accelerator.print(logging_dict)
             train_loss = 0
             training_acc = 0
             training_count = 0

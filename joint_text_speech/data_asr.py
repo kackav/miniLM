@@ -130,6 +130,7 @@ class TextDatasetHF(torch.utils.data.Dataset):
             text = text[:230]
         inp = text
         label = text
+        
         return {"text_trans" : text,
                 "input_ids" : self.bos_token + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
@@ -161,7 +162,7 @@ class AudioDatasetHF(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self.is_fake:
             text = "This is a fake text for resume."
-            audio = torch.zeros(int(self.fake_audio_len * 16000))  # shape (1, fake_audio_len * fs)
+            audio = torch.zeros(int(self.fake_audio_len * 16_000))  # shape (1, fake_audio_len * fs)
             audio = audio.unsqueeze(0)  # add channel dimension
             inp = [0] * self.fake_text_len
             label = [0] * self.fake_text_len
@@ -174,7 +175,6 @@ class AudioDatasetHF(torch.utils.data.Dataset):
                 "labels_len" : self.fake_text_len
                 }
         
-
         #print(f"__getitem__ called with idx={idx}")
         #print(self.data_lengths)
         total_length = 0

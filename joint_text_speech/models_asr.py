@@ -397,6 +397,8 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
             print(f'logits shape:{logits.shape}')
 
         y_logits = logits[:, -labels.shape[1]:]
+        logits = None
+        torch.cuda.empty_cache()
         loss = self.criterion(y_logits.transpose(1, -1), labels)
         accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
         self.printing = False
