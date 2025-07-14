@@ -172,17 +172,24 @@ class TextEncoder(nn.Module):
                  pad_token,
                  num_layers = 2,
                  dropout = 0,
-                 causal=False
+                 causal = False,
+                 dim_lm_embeddings = None
                  ):
         super(TextEncoder, self).__init__()
-        self.embedding = nn.Embedding(
+        if vocab_size is not None:
+            self.embedding = nn.Embedding(
             vocab_size, dim_input, padding_idx=pad_token)
+            self.emb_linear = None
+        else:
+            self.emb_linear = nn.Linear(dim_lm_embeddings, dim_input)
+            self.embedding = None
+        self.vocab_size = vocab_size
         self.positional_embedding = SinusoidalPositionalEmbedding(dim_input, max_len = 512)
         self.blocks = nn.ModuleList([TransformerEncoderBlock(dim_input, num_heads, ff_size, dropout, causal=causal)
                                      for _ in range(num_layers)])
         self.mask_rate = mask_rate
         self.linear = nn.Linear(dim_input, dim_output)
-
+        
         self.config = {
             'mask_rate': mask_rate,
             'vocab_size': vocab_size,
@@ -197,15 +204,20 @@ class TextEncoder(nn.Module):
             'causal': causal,
         }
 
-    def forward(self, x):
+    def forward(self, x, get_lm_embeddings = None):
         # x looks like this: 
             # "text_trans" : text_trans,
             # "input_ids": input_ids,
             # "input_len": input_len,
             # "labels": labels,
             # "labels_len": labels_len
-            # }      
-        features = self.embedding(x['input_ids'])
+            # }
+        if self.vocab_size:
+            features = self.embedding(x['input_ids'])
+        else:
+            features = get_lm_embeddings(x['input_ids'])
+            features = self.emb_linear(features)
+
         text_length = x['input_len']
         mask = torch.rand((features.shape[0], features.shape[1], 1), device=features.device)
         features = torch.where(mask>self.mask_rate, features, torch.zeros_like(features))
@@ -367,7 +379,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
                 print(x['encoder_output_length'])
 
         else:
-            x = self.text_encoder(x)
+            x = self.text_encoder(x, get_lm_embeddings = self.lm.get_input_embeddings())
             if self.printing:
                 print('TextEncoder_output')
                 print(x['TextEncoder_output'].shape)
@@ -398,7 +410,6 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
 
         y_logits = logits[:, -labels.shape[1]:]
         logits = None
-        torch.cuda.empty_cache()
         loss = self.criterion(y_logits.transpose(1, -1), labels)
         accuracy = ((y_logits.argmax(dim=-1) == labels).float()*lengths_to_mask(text_lengths)).sum() / text_lengths.sum()
         self.printing = False
@@ -413,10 +424,6 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
 
     def generate(self, x, max_len, bos_token):  # 100 maxlen
         batch_size = x['audio'].shape[0]
-        if bos_token is None:
-            bos_token = self.tokenizer.eos_token_id
-        else:
-            bos_token = self.tokenizer.encode(bos_token)[0]
         x = self.encoder(x)
         x = self.connector(x)
         connector_output, connector_lengths = x['connector_output'], x['connector_output_length']

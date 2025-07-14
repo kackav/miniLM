@@ -44,10 +44,7 @@ class TextDataset(torch.utils.data.Dataset):
     def __init__(self, data, tokenizer, bos_token):
         self.data = data
         self.tokenizer = tokenizer
-        if bos_token is None:
-            self.bos_token = [self.tokenizer.eos_token_id]
-        else:
-            self.bos_token = self.tokenizer.encode(bos_token)
+        self.bos_token = bos_token
 
     def __len__(self):
         return len(self.data)
@@ -57,7 +54,7 @@ class TextDataset(torch.utils.data.Dataset):
         inp =  text
         label = text
         return {"text_trans" : text,
-                "input_ids" : self.bos_token + self.tokenizer.encode(inp),
+                "input_ids" : [self.bos_token] + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
                 "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
                 "labels_len" : len(self.tokenizer.encode(label)) + 1
@@ -70,11 +67,7 @@ class AudioDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.audio_dir = audio_dir
         self.sample_rate = fs
-
-        if bos_token is None:
-            self.bos = [self.tokenizer.eos_token_id]
-        else:
-            self.bos = self.tokenizer.encode(bos_token)
+        self.bos_token = bos_token
 
     def __len__(self):
         return len(self.data)
@@ -91,7 +84,7 @@ class AudioDataset(torch.utils.data.Dataset):
         return {"audio" : audio,
                 "audio_len" : audio.shape[1],
                 "text_trans" : text,
-                "input_ids" : self.bos + self.tokenizer.encode(inp),
+                "input_ids" : [self.bos_token] + self.tokenizer.encode(inp),
                 "input_len" : len(self.tokenizer.encode(inp)) + 1,
                 "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
                 "labels_len" : len(self.tokenizer.encode(label)) + 1
@@ -104,17 +97,27 @@ class AudioDataset(torch.utils.data.Dataset):
 class TextDatasetHF(torch.utils.data.Dataset):
     def __init__(self, data, tokenizer, bos_token):
         self.data = data
+        self.is_fake = False
         self.data_lengths = {key: len(v) for key,v in data.items()}
         self.tokenizer = tokenizer
-        if bos_token is None:
-            self.bos_token = [self.tokenizer.eos_token_id]
-        else:
-            self.bos_token = self.tokenizer.encode(bos_token)
+        self.bos_token = bos_token
+        self.fake_text_len = 30
 
     def __len__(self):
         return sum(list(self.data_lengths.values()))
 
     def __getitem__(self, idx):
+        if self.is_fake:
+            text = "This is a fake text for resume."
+            inp = [0] * self.fake_text_len
+            label = [0] * self.fake_text_len
+            return {"text_trans": text,
+                "input_ids": inp,
+                "input_len": self.fake_text_len,
+                "labels": label,
+                "labels_len" : self.fake_text_len
+                }
+        
         total_length = 0
         for key, length in self.data_lengths.items():
             previous_length = total_length
@@ -126,34 +129,33 @@ class TextDatasetHF(torch.utils.data.Dataset):
         data_key = self.data[key][idx]
         text = data_key['text'].lower()
         # cut text to max 230 characters
-        if len(text) > 230:
-            text = text[:230]
+        if len(text) > 180:
+            text = text[:180]
         inp = text
         label = text
+        inp_encoded = self.tokenizer.encode(inp, add_special_tokens = False)
+        lab_encoded = self.tokenizer.encode(label, add_special_tokens = False)
         
         return {"text_trans" : text,
-                "input_ids" : self.bos_token + self.tokenizer.encode(inp),
-                "input_len" : len(self.tokenizer.encode(inp)) + 1,
-                "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
-                "labels_len" : len(self.tokenizer.encode(label)) + 1
+                "input_ids" : [self.bos_token] + inp_encoded,
+                "input_len" : len(inp_encoded) + 1,
+                "labels" : lab_encoded + [self.tokenizer.eos_token_id],
+                "labels_len" : len(lab_encoded) + 1
                 }
 
 class AudioDatasetHF(torch.utils.data.Dataset):
     def __init__(self, data, tokenizer, bos_token):
         self.data = data
         self.is_fake = False
-        self.fake_audio_len = 30
-        self.fake_text_len = 230
+        self.fake_audio_len = 20
+        self.fake_text_len = 15
+        self.bos_token = bos_token
         
         #librispeech: iterable(dataset), ...
         self.data_lengths ={k: len(v) for k,v in data.items()}
         # self.cumulative_lengths = torch.sum(self.data_lengths)
         # print(self.cumulative_lengths)
         self.tokenizer = tokenizer
-        if bos_token is None:
-            self.bos = [self.tokenizer.eos_token_id]
-        else:
-            self.bos = self.tokenizer.encode(bos_token)
 
     def __len__(self):
         #print(self.data_lengths.values())
@@ -196,23 +198,23 @@ class AudioDatasetHF(torch.utils.data.Dataset):
         audio = audio.unsqueeze(0)  # add channel dimension
         inp = text
         label = text
+        encoded_inp = self.tokenizer.encode(inp, add_special_tokens = False)
+        encoded_lab = self.tokenizer.encode(label, add_special_tokens = False)
         
         return {"audio" : audio,
                 "audio_len" : audio.shape[1],
                 "text_trans" : text,
-                "input_ids" : self.bos + self.tokenizer.encode(inp),
-                "input_len" : len(self.tokenizer.encode(inp)) + 1,
-                "labels" : self.tokenizer.encode(label) + [self.tokenizer.eos_token_id],
-                "labels_len" : len(self.tokenizer.encode(label)) + 1
+                "input_ids" : [self.bos_token] + encoded_inp,
+                "input_len" : len(encoded_inp) + 1,
+                "labels" : encoded_lab + [self.tokenizer.eos_token_id],
+                "labels_len" : len(encoded_lab) + 1
                 }
         
 
-def load_from_config(ds_type, path):
-    with open(path, 'r') as f:
-        config_datasets = yaml.load(f, Loader=yaml.FullLoader)
-        
+def load_from_config(ds_type, config_datasets, hf_dataset_path):
+    
     loaded_datasets = {}
-    hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
+    #hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
     for k,v in config_datasets[ds_type].items():
         dataset_path = os.path.join(hf_dataset_path, f"prep_{k}_{ds_type}")
         if os.path.exists(dataset_path):
@@ -221,17 +223,15 @@ def load_from_config(ds_type, path):
             loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=4)
 
         else:
-            print(f"prepared dataset not found {k} in {dataset_path}, taking original dataset")
- 
+            print(f"prepared dataset not found {k} in {dataset_path}, taking original dataset and thus filtering audio discarding audios longer then 30s")
             ds_name = v["name"].split(":")[0] if ":" in v["name"] else v["name"]
             ds_subset = v["name"].split(":")[1] if ":" in v["name"] else None
             ds_split = v["split"]
-            ds_text_column = v["text_column"]
+            #ds_text_column = v["text_column"]
             if ds_subset:
                 loaded_datasets[k] = datasets.load_dataset(ds_name, ds_subset, split = ds_split, trust_remote_code=True, num_proc=2)
             else:
                 loaded_datasets[k] = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=2)
-
             if 'audio' in loaded_datasets[k].features:
                 loaded_datasets[k] = loaded_datasets[k].filter(lambda item: len(item['audio']["array"])<(30*16_000), num_proc=4)          
         
