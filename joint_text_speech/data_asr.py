@@ -147,8 +147,8 @@ class AudioDatasetHF(torch.utils.data.Dataset):
     def __init__(self, data, tokenizer, bos_token):
         self.data = data
         self.is_fake = False
-        self.fake_audio_len = 20
-        self.fake_text_len = 15
+        self.fake_audio_len = 30
+        self.fake_text_len = 20
         self.bos_token = bos_token
         
         #librispeech: iterable(dataset), ...
@@ -284,6 +284,35 @@ def collate_fn_text(batch, tokenizer=None):
             "labels_len": labels_len
             }
 
+def collate_all_text(batch_s, batch_t, tokenizer=None):
+    input_ids_s = torch.nn.utils.rnn.unpad_sequence(
+        batch_s['input_ids'], lengths = batch_s['input_len'], batch_first=True
+    )
+    input_ids_t = torch.nn.utils.rnn.unpad_sequence(
+        batch_t['input_ids'], lengths = batch_t['input_len'], batch_first=True
+    )
+    input_ids = input_ids_s + input_ids_t
+
+    labels_s = torch.nn.utils.rnn.unpad_sequence(batch_s['labels'], batch_first=True, lengths = batch_s['labels_len'])
+    labels_t = torch.nn.utils.rnn.unpad_sequence(batch_t['labels'], batch_first=True, lengths = batch_t['labels_len'])
+    labels = labels_s + labels_t
+    
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id if tokenizer is not None else 0
+    )
+    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+
+    input_len = torch.tensor(batch_s['input_len'].tolist()+ batch_t['input_len'].tolist())
+    labels_len = torch.tensor(batch_s['labels_len'].tolist() + batch_t['labels_len'].tolist())
+    text_trans = batch_s['text_trans'] + batch_t['text_trans']
+    
+    
+    return {"text_trans" : text_trans,
+            "input_ids": input_ids,
+            "input_len": input_len,
+            "labels": labels,
+            "labels_len": labels_len
+            }
 
 def load_from_textfile(textfile_path='/mnt/matylda6/ivendrame/miniLM/data/librispeech_shuf.txt'):
 

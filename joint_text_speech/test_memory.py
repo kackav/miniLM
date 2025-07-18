@@ -22,6 +22,7 @@ import accelerate
 #print environment variables
 print("HF datasets cache", os.environ.get('HF_DATASETS_CACHE', ''))
 print("hf home", os.environ.get('HF_HOME', ''))
+hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
 
 def lr_lambda_linear_with_min_lr(step, args):
     peak_lr = args.peak_lr
@@ -112,13 +113,19 @@ def main():
     parser.add_argument('--accumulation_steps', type=int, default=1,
                         help='number of steps to accumulate gradients for')
 
+    parser.add_argument('--peak_connector_lr', type=float, default=5e-4,
+                        help='peak connector learning rate')
     parser.add_argument('--peak_lr', type=float, default=1e-4,
-                        help='peak learning rate')
+                        help='peak encoder learning rate')
+    parser.add_argument('--peak_text_encoder_lr', type=float, default=5e-4,
+                        help = 'peak text encoder learning rate')
     parser.add_argument('--min_lr_ratio', type=float, default=0.4,
                         help='minimum learning rate as a ratio of peak learning rate')
-
+    
+    parser.add_argument('--use_bos_from_lm', action='store_true',
+                        help = "set to True if you want to use lm.config.bos_token. If Lm doesn't have it, specify bos_token argument (default is eos token)")
     parser.add_argument('--bos_token', type=str, default=None, 
-                        help="bos_token for lm, if None takes model.tokenizer.eos_token")
+                        help="bos_token for lm, if None takes eos token from tokenizer")
     parser.add_argument('--weight_decay', type=float, default=0,
                         help='weight decay')
     parser.add_argument('--max_grad_value', type=float, default=5.0,
@@ -185,22 +192,33 @@ def main():
     # device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     device = accelerator.device
     print(f'Using device: {device} - index: {accelerator.process_index}')
+    n_gpus = int(len(os.environ.get('CUDA_VISIBLE_DEVICES'))/2)+1
 
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir=args.log_dir)
     else:
         writer = None
+        
+    input_args = {}
     for arg in vars(args):
         accelerator.print(f'{arg}: {getattr(args, arg)}')
+        input_args[f'{arg}'] = f'{getattr(args, arg)}'
 
-
-    ## MODEL
-    bos_token = args.bos_token
+    ## MODEL    
     lm_model_name = args.lm_model_name
-    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map=accelerator.device)
-    lm_config = {"model_name": lm_model_name,
-                 "bos_token": bos_token if bos_token is not None else lm.config.eos_token_id}
+    lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map=accelerator.device, )
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
+    if args.use_bos_from_lm:
+        bos_token = lm.config.bos_token_id
+    elif args.bos_token is None:
+        bos_token = lm.config.eos_token_id
+    else:
+        bos_token = tokenizer.encode(args.bos_token)[0]
+    
+    lm_config = {"model_name": lm_model_name,
+                "use_bos_from_lm" : args.use_bos_from_lm,
+                "bos_token": bos_token}
+    accelerator.print("lm_config", lm_config)
 
     if args.resume:
         accelerator.print('Resuming from checkpoint')
@@ -233,8 +251,10 @@ def main():
         encoder = models_asr.WavLMWrapper(args.encoder_model_name)
         connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     if args.text_input:
-        text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
-        
+        # initialize embeddings
+        # text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
+        # use llm embeddings
+        text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size)
     #connector = connector.to(torch.bfloat16)
     #text_encoder = text_encoder.to(torch.bfloat16)
     if args.text_input:
@@ -249,34 +269,36 @@ def main():
         model.freeze_lm()
 
     # parameters
-    parameters_to_train = list(model.connector.parameters())
+    parameters_to_train = [{"params": model.connector.parameters(), "lr": args.peak_connector_lr, "weight_decay": args.weight_decay}]
     if args.text_input:
-        parameters_to_train += list(model.text_encoder.parameters())
+        parameters_to_train += [{"params": model.text_encoder.parameters(), "lr": args.peak_text_encoder_lr,"weight_decay": args.weight_decay}]
     if args.train_encoder:
-        parameters_to_train += list(model.encoder.parameters())
+        parameters_to_train += [{"params": model.encoder.parameters(), "lr": args.peak_lr,"weight_decay": args.weight_decay}]
     if args.train_lm:
-        parameters_to_train += list(model.lm.parameters())
+        parameters_to_train += [{"params": model.lm.parameters(),"lr": args.peak_lm_lr,"weight_decay": args.weight_decay}]
+    
 
     accelerator.print(model.config)
     accelerator.print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     accelerator.print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
-
+    batch_asr_size = n_gpus*args.per_device_train_asr_batch_size*args.accumulation_steps
+    batch_text_size =  n_gpus*args.per_device_train_text_batch_size*args.accumulation_steps
+    accelerator.print(f'TEXT Batch size: {batch_text_size}')           
+    accelerator.print(f'ASR Batch size: {batch_asr_size}')        
 
     ## DATASETS
     # validation (dict of datasets)
-    dset_valid = data_asr.load_from_config('validation', args.datasets_config) # dictonary ["commonvoice": ..., "librispeech": ... etc]
+    datasets_config = yaml.load(open(args.datasets_config), Loader=yaml.FullLoader)
+    dset_valid = data_asr.load_from_config('validation', datasets_config, hf_dataset_path) # dictonary ["commonvoice": ..., "librispeech": ... etc]
     val_subsets = {}
     for k, v in dset_valid.items():
         val_subsets[k] = data_asr.AudioDatasetHF({k:v}, tokenizer, bos_token)
     # train dataset
-    dset_train_s = data_asr.load_from_config('train', args.datasets_config)
+    dset_train_s = data_asr.load_from_config('train', datasets_config, hf_dataset_path)
     train_asr_data = data_asr.AudioDatasetHF(dset_train_s, tokenizer, bos_token)
     if args.text_input:
-        dset_train_t = data_asr.load_from_config('text_train', args.datasets_config)
+        dset_train_t = data_asr.load_from_config('text_train', datasets_config, hf_dataset_path)
         train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
-    datasets_config = {"speech_train": dset_train_s,
-                          "text_train": dset_train_t if args.text_input else None,
-                          "validation": dset_valid}
 
     ## Optimizer, scheduler, data loaders
     if args.resume:
@@ -288,7 +310,7 @@ def main():
         scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
         accelerator.print(f'Resuming from step {start_step}')
     else:
-        optimizer = torch.optim.AdamW(parameters_to_train, lr=args.peak_lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(parameters_to_train)
         lr_lambda_partial = functools.partial(lr_lambda, args=args)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
         start_step = 0
@@ -296,37 +318,45 @@ def main():
     torch.manual_seed(24)
     # training dataloader
     collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
-    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_text_batch_size,
+    train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_asr_batch_size,
                                                collate_fn=collate_fn_asr,
                                                shuffle=True,
-                                               num_workers=args.dataloader_num_workers)
+                                               num_workers=args.dataloader_num_workers, prefetch_factor= 16, pin_memory= False)
                                           #     drop_last=True)
      
     if args.text_input:
         collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
-        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_asr_batch_size,
+        train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
-                                               num_workers=args.dataloader_num_workers)                                    
+                                               num_workers=args.dataloader_num_workers, prefetch_factor= 32, pin_memory= False)                                    
     # validation dataloaders    
     validation_loaders = {}
     for name, ds in val_subsets.items():
         validation_loader = torch.utils.data.DataLoader(ds, batch_size=args.per_device_eval_batch_size,
                                                     collate_fn=collate_fn_asr,
-                                                    num_workers=args.dataloader_num_workers)
+                                                    num_workers=args.dataloader_num_workers, prefetch_factor= 8, pin_memory= False)
         validation_loaders[name] = validation_loader
 
     # accelerator preparation
-    model, optimizer, train_asr_loader, train_text_loader = accelerator.prepare(
-        model, optimizer, train_asr_loader, train_text_loader
-    )
+    if args.text_input:
+        model, optimizer, train_asr_loader, train_text_loader = accelerator.prepare(
+            model, optimizer, train_asr_loader, train_text_loader
+        )
+    else:
+        model, optimizer, train_asr_loader = accelerator.prepare(
+            model, optimizer, train_asr_loader
+        )
     for k, v in validation_loaders.items():
         validation_loaders[k] = accelerator.prepare(v)
+    # #### FAKE ####
     train_asr_loader.dataset.is_fake = True
-    train_text_loader_iter = iter(train_text_loader)
+    train_text_loader.is_fake = True
+
+    if args.text_input:
+        train_text_loader_iter = iter(train_text_loader)
     train_asr_loader_iter = iter(train_asr_loader)
-    
-    
+
     if args.resume:
         train_asr_loader.dataset.is_fake = True
         train_asr_loader_iter = iter(train_asr_loader)
@@ -342,7 +372,22 @@ def main():
                     break
             if found:
                 break
-    
+        if args.text_input:
+            train_text_loader.dataset.is_fake = True
+            train_text_loader_iter = iter(train_text_loader)
+            found = False
+            current_step = 0
+            while True:
+                for _ in train_text_loader:
+                    current_step += 1
+                    if current_step == start_step:
+                        train_text_loader.dataset.is_fake = False
+                        train_text_loader = iter(train_text_loader)
+                        found = True
+                        break
+                if found:
+                    break
+        
 
     ## TRAINING LOOP
     accelerator.print(f'Starting step: {start_step}, max steps: {args.max_steps}')
@@ -478,24 +523,34 @@ def main():
             if args.text_input:
                 writer.add_scalar("Loss/text_rain", loss_t, j)
                 writer.add_scalar("Accuracy/text_train", acc_t, j)
+                writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
+                writer.add_scalar("Data/Batch Text Size", batch_t['labels'].shape[0]*args.accumulation_steps*n_gpus, j)
+            
                 if args.train_with_asr_text:
                     writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
                     if args.mse_loss:
                         writer.add_scalar("Loss/mse_loss", mse_loss, j)
-            writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], j)
+            writer.add_scalar("Learning Rate/Connector", optimizer.param_groups[0]['lr'], j)
+            writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
+            writer.add_scalar("Learning Rate/Encoder", optimizer.param_groups[2]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
             
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
             writer.add_scalar("Data/Text Length", batch_s['input_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
-            writer.add_scalar("Data/Batch Size", batch_s['audio'].shape[0], j)
+            writer.add_scalar("Data/Batch Asr Size", batch_s['audio'].shape[0]*args.accumulation_steps*n_gpus, j)
             writer.add_scalar("Loss/Gradient Norm", grad_norm.item(), j)
 
         ## VALIDATION LOOP
         if j > 0 and j % args.validation_steps == 0:
             start_time = time.time()
             model.eval()
+            train_loss = train_loss / training_count
+            training_acc = training_acc / training_count
+            if accelerator.is_main_process:
+                for _k, _p in accelerator.unwrap_model(model).named_parameters():
+                    if _p.requires_grad:
+                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().float().numpy(), j)            
             for ds_name, val_dataset_loader in validation_loaders.items():
                 with torch.no_grad():
                     val_loss = 0
@@ -513,79 +568,75 @@ def main():
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             z, loss, acc = model(val_x, is_text = False, output_hidden_states=False)
-                        val_loss += (loss).mean().item()
-                        val_acc += acc.mean().item()
+                        val_loss += accelerator.gather(loss).mean().item()
+                        val_acc += accelerator.gather(acc).mean().item()
                         val_count += 1
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
                         text_y = val_batch['text_trans']
-
                         all_transcriptions += text_x
                         all_references += text_y
-
-                output_wer = jiwer.process_words(all_references, all_transcriptions)
-                insertions = output_wer.insertions
-                deletions = output_wer.deletions
-                substitutions = output_wer.substitutions
-                wer = output_wer.wer
-                cer = jiwer.cer(all_references, all_transcriptions)
-                num_words = sum(len(t.split()) for t in all_transcriptions)
-                num_chars = sum(len(t) for t in all_transcriptions)
-
-                metrics = torch.tensor([insertions, deletions, substitutions, wer * num_words, cer * num_chars, num_words, num_chars], device=device)
-                current_time = time.time()
-                performance = (current_time - start_time) / 60  # in minutes
-                print(f"Validation on {ds_name} ended at {datetime.datetime.now()} for process {accelerator.process_index}, took {performance:.2f} minutes")
-                accelerator.wait_for_everyone()
-                metrics = accelerator.reduce(metrics, reduction='sum')
-                insertions, deletions, substitutions, wer, cer, num_words, num_chars = metrics.tolist()
-                wer = wer / num_words
-                cer = cer / num_chars
-
-                # Log validation metrics
-                if accelerator.is_main_process:
-                    accelerator.print(ds_name)
-                    accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
-                
-                    full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
-                    #full_trt = sorted(full_trt, key=lambda x: x[0])
-                    to_write = full_trt[:50]
-                    to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
-                    # Prepend header
-                    to_write = ['| Reference | Transcription |\n',
-                    '|------------|---------------|\n'] + to_write
-                    to_write = ''.join(to_write)
-                    writer.add_text('WER', to_write, j)
-                    #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
                     val_loss = val_loss / val_count
-                    writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)
-                    val_acc = val_acc / val_count                         
-                    writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
-                    writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
-                    writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
-                    writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
-                    writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
-                    writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
+                    val_acc = val_acc / val_count    
+                    output_wer = jiwer.process_words(all_references, all_transcriptions)
+                    insertions = output_wer.insertions
+                    deletions = output_wer.deletions
+                    substitutions = output_wer.substitutions
+                    wer = output_wer.wer
+                    cer = jiwer.cer(all_references, all_transcriptions)
+                    num_words = sum(len(t.split()) for t in all_transcriptions)
+                    num_chars = sum(len(t) for t in all_transcriptions)
 
-            train_loss = train_loss / training_count
-            training_acc = training_acc / training_count
-            if accelerator.is_main_process:
-                for _k, _p in accelerator.unwrap_model(model).named_parameters():
-                    if _p.requires_grad:
-                        writer.add_histogram(f"Parameters/{_k}", _p.detach().cpu().float().numpy(), j)            
-            logging_dict = {
-                'step': j,
-                'dataset' : ds_name,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'train_acc': training_acc,
-                'val_acc': val_acc,
-                'wer' : wer,
-                'learning_rate': optimizer.param_groups[0]['lr'],
-                }
-            all_metrics.append(logging_dict)
-            accelerator.print(logging_dict)
+                    metrics = torch.tensor([insertions, deletions, substitutions, wer * num_words, cer * num_chars, num_words, num_chars], device=device)
+                    current_time = time.time()
+                    performance = (current_time - start_time) / 60  # in minutes
+                    print(f"Validation on {ds_name} ended at {datetime.datetime.now()} for process {accelerator.process_index}, took {performance:.2f} minutes")
+                    accelerator.wait_for_everyone()
+                    metrics = accelerator.reduce(metrics, reduction='sum')
+                    insertions, deletions, substitutions, wer, cer, num_words, num_chars = metrics.tolist()
+                    wer = wer / num_words
+                    cer = cer / num_chars
+
+                    # Log validation metrics
+                    if accelerator.is_main_process:
+                        accelerator.print(ds_name)
+                        accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
+                    
+                        full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
+                        #full_trt = sorted(full_trt, key=lambda x: x[0])
+                        to_write = full_trt[:50]
+                        to_write = [f'| {x[0]} | {x[1]} |\n' for x in to_write]
+                        # Prepend header
+                        to_write = ['| Reference | Transcription |\n',
+                        '|------------|---------------|\n'] + to_write
+                        to_write = ''.join(to_write)
+                        writer.add_text(f'WER_{ds_name}', to_write, j)
+                        #writer.add_text('WER', f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}', j)
+                        writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
+                        writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
+                        writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
+                        writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
+                        writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
+                        writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
+                        writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
+                        logging_dict = {
+                            'step': j,
+                            'dataset' : ds_name,
+                            'train_loss': train_loss,
+                            'val_loss': val_loss,
+                            'train_acc': training_acc,
+                            'val_acc': val_acc,
+                            'wer' : wer,
+                            'learning_rate' : optimizer.param_groups[0]['lr'],
+                            'learning_rate_Connector': optimizer.param_groups[0]['lr'],
+                            'learning_rate_TextEncoder': optimizer.param_groups[1]['lr'],
+                            'learning_rate_Encoder': optimizer.param_groups[2]['lr'],
+                            'batch_asr' : batch_asr_size,
+                            'batch_text' : batch_text_size
+                            }
+                        all_metrics.append(logging_dict)
+                        accelerator.print(logging_dict)
             train_loss = 0
             training_acc = 0
             training_count = 0
@@ -613,9 +664,6 @@ def main():
                     yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
             recent_wer = [m['wer'] for m in all_metrics[-args.early_stopping_patience:]]
             all_wers = [m['wer'] for m in all_metrics]
-            if len(all_wers) > args.early_stopping_patience and all(v > min(all_wers) for v in recent_wer):
-                accelerator.print('Early stopping')
-                break
 
         if j % args.save_steps == 0 and accelerator.is_main_process:
             accelerator.unwrap_model(model).connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
@@ -626,9 +674,15 @@ def main():
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
             yaml.dump(lm_config, open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w'))
             yaml.dump(datasets_config, open(os.path.join(args.output_dir, 'datasets_config.yaml'), 'w'))
+            yaml.dump(input_args, open(os.path.join(args.output_dir, "input_args.yaml"), 'w'))
 
         if accelerator.is_main_process:
             writer.flush()
+        
+        if j > 0 and j % args.validation_steps == 0:
+            if len(all_wers) > args.early_stopping_patience and all(v > min(all_wers) for v in recent_wer):
+                accelerator.print('Early stopping')
+                break
             
     accelerator.print('Training complete!')
 

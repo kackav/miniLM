@@ -121,7 +121,8 @@ def main():
                         help = 'peak text encoder learning rate')
     parser.add_argument('--min_lr_ratio', type=float, default=0.4,
                         help='minimum learning rate as a ratio of peak learning rate')
-    
+    parser.add_argument('--use_llm_emb', action='store_true',
+                        help = "set to True if you don't want to initialize new embeddings in the Text Encoder")
     parser.add_argument('--use_bos_from_lm', action='store_true',
                         help = "set to True if you want to use lm.config.bos_token. If Lm doesn't have it, specify bos_token argument (default is eos token)")
     parser.add_argument('--bos_token', type=str, default=None, 
@@ -210,10 +211,11 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
     if args.use_bos_from_lm:
         bos_token = lm.config.bos_token_id
-    elif args.bos_token is None:
-        bos_token = lm.config.eos_token_id
     else:
-        bos_token = tokenizer.encode(args.bos_token)[0]
+        if args.bos_token is None:
+            bos_token = lm.config.eos_token_id
+        else:
+            bos_token = tokenizer.encode(args.bos_token)[0]
     
     lm_config = {"model_name": lm_model_name,
                 "use_bos_from_lm" : args.use_bos_from_lm,
@@ -254,7 +256,10 @@ def main():
         # initialize embeddings
         # text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
         # use llm embeddings
-        text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size)
+        if args.use_llm_emb:
+            text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size)
+        else:
+            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
     #connector = connector.to(torch.bfloat16)
     #text_encoder = text_encoder.to(torch.bfloat16)
     if args.text_input:
@@ -329,7 +334,7 @@ def main():
         train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
-                                               num_workers=args.dataloader_num_workers, prefetch_factor= 32, pin_memory= False)                                    
+                                               num_workers=args.dataloader_num_workers, prefetch_factor= 16, pin_memory= False)                                    
     # validation dataloaders    
     validation_loaders = {}
     for name, ds in val_subsets.items():
@@ -452,20 +457,24 @@ def main():
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                         z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
                         if args.text_input:
-                            z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
-                            loss = loss_s + args.text_weight*loss_t
                             if args.train_with_asr_text:
-                                z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
+                                x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
+                                z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True)
+                                hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
+                                padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
+
                                 if args.mse_loss:
-                                    z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
-                                    mse_loss = ((hidden_states_s - hidden_states_t)**2).to(device) #bxNxdims
+                                    mse_loss = ((hidden_states_s - hidden_states_s_t[:,padded_len:,:])**2).to(device) #bxNxdims
                                     lengths = x_s_clone['input_len'].to(device)
                                     mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
                                     mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                                     mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
-                                    loss += mse_loss
-                                else:
-                                    loss += args.text_weight*loss_s_t
+                                    loss_t += mse_loss
+                                
+                            else:
+                                z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
+
+                            loss = loss_s + args.text_weight*loss_t
                         else:
                             loss = loss_s
                     (loss/args.accumulation_steps).backward()
@@ -474,20 +483,24 @@ def main():
                 with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                     z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
                     if args.text_input:
-                        z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
-                        loss = loss_s + args.text_weight*loss_t
                         if args.train_with_asr_text:
-                            z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
+                            x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
+                            z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True)
+                            hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
+                            padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
+
                             if args.mse_loss:
-                                z_s_t, loss_s_t, acc_s_t, hidden_states_t = model(x_s_clone, is_text = True, output_hidden_states=True)
-                                mse_loss = ((hidden_states_s - hidden_states_t)**2).to(device) #bxNxdims
+                                mse_loss = ((hidden_states_s - hidden_states_s_t[:,padded_len:,:])**2).to(device) #bxNxdims
                                 lengths = x_s_clone['input_len'].to(device)
                                 mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
                                 mse_loss = mse_loss*mask[:, :, None] #bxNxdims
-                                mse_loss = mse_loss.sum() / (mask.sum()*hidden_states_s.shape[-1])
-                                loss += mse_loss
-                            else:
-                                loss += args.text_weight*loss_s_t
+                                mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
+                                loss_t += mse_loss
+                            
+                        else:
+                            z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
+
+                        loss = loss_s + args.text_weight*loss_t
                     else:
                         loss = loss_s
                 
@@ -503,11 +516,11 @@ def main():
         if args.text_input:
             loss_t = accelerator.gather(loss_t).mean().item()
             acc_t = accelerator.gather(acc_t).mean().item()
-            if args.train_with_asr_text:
-                loss_s_t = accelerator.gather(loss_s_t).mean().item()
-                acc_s_t = accelerator.gather(acc_s_t).mean().item()
-                if args.mse_loss:
-                    mse_loss = accelerator.gather(mse_loss).mean().item()
+            # if args.train_with_asr_text:
+            #     loss_s_t = accelerator.gather(loss_s_t).mean().item()
+            #     acc_s_t = accelerator.gather(acc_s_t).mean().item()
+            if args.mse_loss:
+                mse_loss = accelerator.gather(mse_loss).mean().item()
             else:
                 loss_s_t = None
                 acc_s_t = None
@@ -527,8 +540,8 @@ def main():
                 writer.add_scalar("Data/Batch Text Size", batch_t['labels'].shape[0]*args.accumulation_steps*n_gpus, j)
             
                 if args.train_with_asr_text:
-                    writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
-                    writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
+                    # writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
+                    # writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
                     if args.mse_loss:
                         writer.add_scalar("Loss/mse_loss", mse_loss, j)
             writer.add_scalar("Learning Rate/Connector", optimizer.param_groups[0]['lr'], j)

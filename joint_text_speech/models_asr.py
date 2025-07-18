@@ -103,7 +103,7 @@ class WavLMWrapper(nn.Module):
     def load_from_dir(cls, output_dir, device=None):
         with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-        model = cls(**config, deactivate_masked_spec_embed=False)
+        model = cls(**config, deactivate_masked_spec_embed=True)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
         if hasattr(model.encoder, 'masked_spec_embed'):
             model.encoder.masked_spec_embed = None
