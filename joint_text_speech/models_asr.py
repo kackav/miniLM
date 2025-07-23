@@ -100,10 +100,10 @@ class WavLMWrapper(nn.Module):
         torch.save(self.state_dict(), os.path.join(output_dir, 'encoder_model.pt'))
     
     @classmethod
-    def load_from_dir(cls, output_dir, device=None):
+    def load_from_dir(cls, output_dir, device=None, deactivate_masked_spec_embed = False):
         with open(os.path.join(output_dir, 'encoder_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-        model = cls(**config, deactivate_masked_spec_embed=True)
+        model = cls(**config, deactivate_masked_spec_embed=deactivate_masked_spec_embed)
         model.load_state_dict(torch.load(os.path.join(output_dir, 'encoder_model.pt'), weights_only=True, map_location=device))
         if hasattr(model.encoder, 'masked_spec_embed'):
             model.encoder.masked_spec_embed = None
@@ -202,6 +202,7 @@ class TextEncoder(nn.Module):
             'pad_token': pad_token,
            # 'tokenizer': tokenizer.__dict__,
             'causal': causal,
+            'dim_lm_embeddings' : dim_lm_embeddings
         }
 
     def forward(self, x, get_lm_embeddings = None):
@@ -246,7 +247,7 @@ class TextEncoder(nn.Module):
         torch.save(self.state_dict(), os.path.join(output_dir, 'TextEncoder_model.pt'))
 
     @classmethod
-    def load_from_dir(cls, output_dir, device=None):
+    def load_from_dir(cls, output_dir, device=None,):
         with open(os.path.join(output_dir, 'TextEncoder_config.yaml'), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(**config)
@@ -363,7 +364,7 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
         for param in self.lm.parameters():
             param.requires_grad = False
 
-    def forward(self, x, is_text = False, output_hidden_states=False):
+    def forward(self, x, is_text = False, output_hidden_states=False, last_layer_MSE = False):
         text, text_lengths = x['input_ids'], x['input_len']
         labels, labels_lengths = x['labels'], x['labels_len']
         if self.printing:
@@ -418,8 +419,12 @@ class EncoderConnectorLmWithPretrainedLm(nn.Module):
             return y_logits, loss, accuracy
         
         sliced = [layer[:, -labels.shape[1]:, :] for layer in lm_outputs['hidden_states']]
-        hidden_states = torch.cat(sliced, dim = -1)
-        
+        #hidden_states = torch.cat(sliced, dim = -1)
+        #   LaST lAY mse
+        if last_layer_MSE:
+            hidden_states = sliced[-1]
+        else:
+            hidden_states = torch.cat(sliced, dim = -1)
         return y_logits, loss, accuracy, hidden_states
 
     def generate(self, x, max_len, bos_token):  # 100 maxlen

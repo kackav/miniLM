@@ -91,7 +91,8 @@ def main():
 
     parser.add_argument('--dataloader_num_workers', type=int, default=4,
                         help='number of workers for dataloader')
-
+    parser.add_argument('--dataloader_num_workers_val', type=int, default=4,
+                        help='number of workers for val dataloader')
     parser.add_argument('--validation_steps', type=int, default=1000,
                         help='number of steps between validation runs')
     parser.add_argument('--save_steps', type=int, default=1000,
@@ -162,6 +163,8 @@ def main():
                         help='use text input from asr dataset for training, aligned with speech training, if False use text input from text dataset')
     parser.add_argument('--mse_loss', action='store_true',
                         help='only use in case asr text is true and text input is true, this will use mse loss between hidden states of text encoder and connector')
+    parser.add_argument('--last_layer_mse', action='store_true',
+                        help='only use in case asr text is true, text input is true, and mse loss is true, this will use mse loss between last layer hidden states of text encoder and connector')
     parser.add_argument('--encoder_eval', action='store_true',
                         help='eval mode for encoder during training, if False train mode')
     parser.add_argument('--connector_eval', action='store_true',
@@ -173,6 +176,8 @@ def main():
 
     parser.add_argument('--text_weight', type=float, default=0.5,
                         help='weight for text encoder loss')
+    parser.add_argument('--mse_weight', type=float, default=0.125,
+                        help='weight for Mse loss')
     parser.add_argument('--mask_rate', type=float, default=0.5,
                         help='mask rate for text encoder')
     parser.add_argument('--text_encoder_dim', type=int, default=512,
@@ -231,7 +236,7 @@ def main():
             text_encoder = models_asr.TextEncoder.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
             text_encoder = text_encoder.to(device)
         if args.train_encoder:
-            encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
+            encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.output_dir, 'latest'), device, deactivate_masked_spec_embed = True)
             #encoder= encoder.to(torch.bfloat16)
             encoder = encoder.to(device)
 
@@ -244,24 +249,22 @@ def main():
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
         best_val_loss = min([m['val_loss'] for m in all_metrics])
-    
-    if args.pretrained_dir is not None:
+
+    elif args.pretrained_dir is not None:
         accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
+        connector = connector.to(device)
         encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
     else:
+        print("initialize model parts")
         encoder = models_asr.WavLMWrapper(args.encoder_model_name)
         connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
     if args.text_input:
-        # initialize embeddings
-        # text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
-        # use llm embeddings
         if args.use_llm_emb:
             text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size)
         else:
             text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
-    #connector = connector.to(torch.bfloat16)
-    #text_encoder = text_encoder.to(torch.bfloat16)
+
     if args.text_input:
         model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
     else:
@@ -275,10 +278,10 @@ def main():
 
     # parameters
     parameters_to_train = [{"params": model.connector.parameters(), "lr": args.peak_connector_lr, "weight_decay": args.weight_decay}]
-    if args.text_input:
-        parameters_to_train += [{"params": model.text_encoder.parameters(), "lr": args.peak_text_encoder_lr,"weight_decay": args.weight_decay}]
     if args.train_encoder:
         parameters_to_train += [{"params": model.encoder.parameters(), "lr": args.peak_lr,"weight_decay": args.weight_decay}]
+    if args.text_input:
+        parameters_to_train += [{"params": model.text_encoder.parameters(), "lr": args.peak_text_encoder_lr,"weight_decay": args.weight_decay}]
     if args.train_lm:
         parameters_to_train += [{"params": model.lm.parameters(),"lr": args.peak_lm_lr,"weight_decay": args.weight_decay}]
     
@@ -311,7 +314,7 @@ def main():
         lr_lambda_partial = functools.partial(lr_lambda, args=args)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_partial)
         start_step = all_metrics[-1]['step']
-        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt')))
+        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'optimizer.pt'), map_location=accelerator.device))
         scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, 'latest', 'scheduler.pt')))
         accelerator.print(f'Resuming from step {start_step}')
     else:
@@ -340,7 +343,7 @@ def main():
     for name, ds in val_subsets.items():
         validation_loader = torch.utils.data.DataLoader(ds, batch_size=args.per_device_eval_batch_size,
                                                     collate_fn=collate_fn_asr,
-                                                    num_workers=args.dataloader_num_workers, prefetch_factor= 8, pin_memory= False)
+                                                    num_workers=args.dataloader_num_workers_val, prefetch_factor= 8, pin_memory= False)
         validation_loaders[name] = validation_loader
 
     # accelerator preparation
@@ -377,6 +380,8 @@ def main():
                     break
             if found:
                 break
+            else:
+                train_asr_loader_iter = iter(train_asr_loader)
         if args.text_input:
             train_text_loader.dataset.is_fake = True
             train_text_loader_iter = iter(train_text_loader)
@@ -392,7 +397,9 @@ def main():
                         break
                 if found:
                     break
-        
+                else:
+                    train_text_loader_iter = iter(train_text_loader)
+
 
     ## TRAINING LOOP
     accelerator.print(f'Starting step: {start_step}, max steps: {args.max_steps}')
@@ -455,13 +462,14 @@ def main():
             if k < args.accumulation_steps - 1:
                 with model.no_sync():
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                        z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
+                        z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                         if args.text_input:
                             if args.train_with_asr_text:
                                 x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
-                                z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True)
+                                z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                                 hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                                 padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
+                                loss_t = args.text_weight*loss_t
 
                                 if args.mse_loss:
                                     mse_loss = ((hidden_states_s - hidden_states_s_t[:,padded_len:,:])**2).to(device) #bxNxdims
@@ -469,23 +477,23 @@ def main():
                                     mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
                                     mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                                     mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
-                                    loss_t += mse_loss
+                                    loss_t += args.mse_loss*mse_loss
                                 
                             else:
                                 z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
 
-                            loss = loss_s + args.text_weight*loss_t
+                            loss = loss_s + loss_t
                         else:
                             loss = loss_s
                     (loss/args.accumulation_steps).backward()
             
             else:
                 with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                    z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True)
+                    z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = True)
                     if args.text_input:
                         if args.train_with_asr_text:
                             x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
-                            z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True)
+                            z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = True)
                             hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                             padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
 
@@ -538,15 +546,15 @@ def main():
                 writer.add_scalar("Accuracy/text_train", acc_t, j)
                 writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
                 writer.add_scalar("Data/Batch Text Size", batch_t['labels'].shape[0]*args.accumulation_steps*n_gpus, j)
-            
+                writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[2]['lr'], j)
                 if args.train_with_asr_text:
                     # writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     # writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
                     if args.mse_loss:
                         writer.add_scalar("Loss/mse_loss", mse_loss, j)
             writer.add_scalar("Learning Rate/Connector", optimizer.param_groups[0]['lr'], j)
-            writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
-            writer.add_scalar("Learning Rate/Encoder", optimizer.param_groups[2]['lr'], j)
+            if args.train_encoder:
+                writer.add_scalar("Learning Rate/Encoder", optimizer.param_groups[1]['lr'], j)
             writer.add_scalar("Accuracy/train", acc_s, j)
             
             writer.add_scalar("Data/Audio Length", batch_s['audio_len'].float().mean().item(), j)
@@ -642,9 +650,6 @@ def main():
                             'val_acc': val_acc,
                             'wer' : wer,
                             'learning_rate' : optimizer.param_groups[0]['lr'],
-                            'learning_rate_Connector': optimizer.param_groups[0]['lr'],
-                            'learning_rate_TextEncoder': optimizer.param_groups[1]['lr'],
-                            'learning_rate_Encoder': optimizer.param_groups[2]['lr'],
                             'batch_asr' : batch_asr_size,
                             'batch_text' : batch_text_size
                             }
