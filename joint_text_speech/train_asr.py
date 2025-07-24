@@ -254,7 +254,7 @@ def main():
         accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
         connector = connector.to(device)
-        encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
+        encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device, deactivate_masked_spec_embed = True)
     else:
         print("initialize model parts")
         encoder = models_asr.WavLMWrapper(args.encoder_model_name)
@@ -477,7 +477,7 @@ def main():
                                     mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
                                     mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                                     mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
-                                    loss_t += args.mse_loss*mse_loss
+                                    loss_t += args.mse_weight*mse_loss
                                 
                             else:
                                 z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
@@ -489,11 +489,11 @@ def main():
             
             else:
                 with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                    z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = True)
+                    z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                     if args.text_input:
                         if args.train_with_asr_text:
                             x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
-                            z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = True)
+                            z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                             hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                             padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
 
