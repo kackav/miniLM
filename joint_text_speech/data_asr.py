@@ -12,6 +12,7 @@ from tokenizers.trainers import BpeTrainer
 from tokenizers.decoders import BPEDecoder
 import datasets
 import yaml
+import re
 
 def train_bpe(data, vocab_size=1024, special_tokens=None, output_dir='tokenizer', num_sentences=100000):
     if special_tokens is None:
@@ -101,7 +102,9 @@ class TextDatasetHF(torch.utils.data.Dataset):
         self.data_lengths = {key: len(v) for key,v in data.items()}
         self.tokenizer = tokenizer
         self.bos_token = bos_token
-        self.fake_text_len = 30
+        self.fake_text_len = 5
+        self.cropped_text = 0
+        self.max_text_length = 30
 
     def __len__(self):
         return sum(list(self.data_lengths.values()))
@@ -128,19 +131,27 @@ class TextDatasetHF(torch.utils.data.Dataset):
 
         data_key = self.data[key][idx]
         text = data_key['text'].lower()
+        #text = self.normalizer(text) 
+        text = re.sub(r"[^\w\s']|(?<!\w)'|'(?!\w)", "", text).lower()
         # cut text to max 230 characters
-        if len(text) > 180:
-            text = text[:180]
+        # if len(text) > 180:
+        #     text = text[:180]
         inp = text
         label = text
         inp_encoded = self.tokenizer.encode(inp, add_special_tokens = False)
+        input_ids = [self.bos_token] + inp_encoded
         lab_encoded = self.tokenizer.encode(label, add_special_tokens = False)
-        
+        labels = lab_encoded + [self.tokenizer.eos_token_id]
+        if len(input_ids)>self.max_text_length:
+            input_ids = input_ids[:self.max_text_length]
+            labels = labels[:self.max_text_length]
+            self.cropped_text +=1
+
         return {"text_trans" : text,
-                "input_ids" : [self.bos_token] + inp_encoded,
-                "input_len" : len(inp_encoded) + 1,
-                "labels" : lab_encoded + [self.tokenizer.eos_token_id],
-                "labels_len" : len(lab_encoded) + 1
+                "input_ids" : input_ids,
+                "input_len" : len(input_ids),
+                "labels" : labels,
+                "labels_len" : len(labels)
                 }
 
 class AudioDatasetHF(torch.utils.data.Dataset):
@@ -190,7 +201,8 @@ class AudioDatasetHF(torch.utils.data.Dataset):
          #normalized data structure - if dataset doesn't have it, prep it according to commonvoice_prep.py
         data_key = self.data[key][idx]
         text = data_key['normalized_text'] #if "normalized_text" in data_key else data_key["text"].lower()
-        audio_path = data_key['audio']['path']
+        # print(data_key["audio"])
+        text = re.sub(r"[^\w\s']|(?<!\w)'|'(?!\w)", "", text).lower()
         audio = torch.tensor(data_key['audio']['array'], dtype=torch.float32)
         sample_rate = data_key['audio']['sampling_rate']
         if sample_rate != 16000:
@@ -212,15 +224,24 @@ class AudioDatasetHF(torch.utils.data.Dataset):
         
 
 def load_from_config(ds_type, config_datasets, hf_dataset_path):
-    
     loaded_datasets = {}
     #hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
     for k,v in config_datasets[ds_type].items():
         dataset_path = os.path.join(hf_dataset_path, f"prep_{k}_{ds_type}")
-        if os.path.exists(dataset_path):
+        if "path_to_subsets" in v:
+            #dataset_path = os.path.join(dataset_path, v["path_to_subsets"]
+            print(f"loading prepared subsets of dataset {k} from {dataset_path}")
+            #dataset_path = os.path.join(dataset_path, f"prep_{k}_{split}_")
+            for ds in os.listdir(dataset_path):
+                loaded_dataset = datasets.load_from_disk(os.path.join(dataset_path, ds))
+                loaded_datasets[ds]= loaded_dataset
+        
+        elif os.path.exists(dataset_path):
             print(f"loading prepared dataset {k} from {dataset_path}")
             loaded_datasets[k] = datasets.load_from_disk(dataset_path)
-            loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=4)
+            if 'audio_len' in loaded_datasets[k].features:
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']<(30*16_000), num_proc=4)
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: item['audio_len']>(0.5*16_000), num_proc=4)
 
         else:
             print(f"prepared dataset not found {k} in {dataset_path}, taking original dataset and thus filtering audio discarding audios longer then 30s")
@@ -229,11 +250,12 @@ def load_from_config(ds_type, config_datasets, hf_dataset_path):
             ds_split = v["split"]
             #ds_text_column = v["text_column"]
             if ds_subset:
-                loaded_datasets[k] = datasets.load_dataset(ds_name, ds_subset, split = ds_split, trust_remote_code=True, num_proc=2)
+                loaded_datasets[k] = datasets.load_dataset(ds_name, ds_subset, split = ds_split,  num_proc=2) #trust_remote_code=True,
             else:
-                loaded_datasets[k] = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=2)
+                loaded_datasets[k] = datasets.load_dataset(ds_name, split = ds_split, num_proc=2)#trust_remote_code=True,
             if 'audio' in loaded_datasets[k].features:
-                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: len(item['audio']["array"])<(30*16_000), num_proc=4)          
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: len(item['audio']["array"])<(30*16_000), num_proc=4)
+                loaded_datasets[k] = loaded_datasets[k].filter(lambda item: len(item['audio']["array"])>(0.5*16_000), num_proc=4)          
         
     return loaded_datasets
 

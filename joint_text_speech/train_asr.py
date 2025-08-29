@@ -18,11 +18,13 @@ from torch.utils.tensorboard import SummaryWriter
 import transformers
 import datasets
 import accelerate
+from whisper_normalizer.english import EnglishSpellingNormalizer
+
 
 #print environment variables
 print("HF datasets cache", os.environ.get('HF_DATASETS_CACHE', ''))
 print("hf home", os.environ.get('HF_HOME', ''))
-hf_dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
+hf_dataset_path = os.environ.get('HF_HOME', '')+ '/modules/datasets_modules/datasets'
 
 def lr_lambda_linear_with_min_lr(step, args):
     peak_lr = args.peak_lr
@@ -182,7 +184,14 @@ def main():
                         help='mask rate for text encoder')
     parser.add_argument('--text_encoder_dim', type=int, default=512,
                         help='text encoder dimension')
-    
+    parser.add_argument('--connector_layers', type = int, default = 2,
+                        help = 'number of connector layers')
+    parser.add_argument('--text_encoder_layers', type = int, default = 2,
+                        help = 'number of text encoder layers')
+    parser.add_argument('--dataset_for_choosing_checkpoint',
+                        help='validation dataset fo choosing the best checkpoint.'
+                        'If unspecified, defaults to the validation dataset in the yaml')
+    parser.add_argument('--mse_loss_logit', action='store_true', help = 'trai with mse loss calculated on logits')
 
     args = parser.parse_args()
     #torch.set_default_dtype(torch.bfloat16)
@@ -198,7 +207,8 @@ def main():
     # device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     device = accelerator.device
     print(f'Using device: {device} - index: {accelerator.process_index}')
-    n_gpus = int(len(os.environ.get('CUDA_VISIBLE_DEVICES'))/2)+1
+    # n_gpus = int(len(os.environ.get('CUDA_VISIBLE_DEVICES'))/2)+1
+    n_gpus = accelerator.num_processes
 
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir=args.log_dir)
@@ -227,6 +237,8 @@ def main():
                 "bos_token": bos_token}
     accelerator.print("lm_config", lm_config)
 
+    best_wer = float('inf')
+    all_metrics = []
     if args.resume:
         accelerator.print('Resuming from checkpoint')
         connector = models_asr.Connector.load_from_dir(os.path.join(args.output_dir, 'latest'), device)
@@ -255,15 +267,21 @@ def main():
         connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
         connector = connector.to(device)
         encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device, deactivate_masked_spec_embed = True)
+        if args.text_input:
+            if args.use_llm_emb:
+                text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size, num_layers = args.text_encoder_layers)
+            else:
+                text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, num_layers = args.text_encoder_layers)
     else:
         print("initialize model parts")
         encoder = models_asr.WavLMWrapper(args.encoder_model_name)
-        connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size)
-    if args.text_input:
-        if args.use_llm_emb:
-            text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size)
-        else:
-            text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id)
+        connector = models_asr.Connector(encoder.encoder.config.hidden_size, lm.config.hidden_size, num_heads = 4, ff_size = 4*encoder.encoder.config.hidden_size, num_connector_layers = args.connector_layers)
+    
+        if args.text_input:
+            if args.use_llm_emb:
+                text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size, num_layers = args.text_encoder_layers)
+            else:
+                text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, num_layers = args.text_encoder_layers)
 
     if args.text_input:
         model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
@@ -301,6 +319,10 @@ def main():
     val_subsets = {}
     for k, v in dset_valid.items():
         val_subsets[k] = data_asr.AudioDatasetHF({k:v}, tokenizer, bos_token)
+    if args.dataset_for_choosing_checkpoint is None:
+        dataset_for_choosing_checkpoint = list(val_subsets.keys())[-1]
+    else:
+        dataset_for_choosing_checkpoint = args.dataset_for_choosing_checkpoint
     # train dataset
     dset_train_s = data_asr.load_from_config('train', datasets_config, hf_dataset_path)
     train_asr_data = data_asr.AudioDatasetHF(dset_train_s, tokenizer, bos_token)
@@ -406,9 +428,12 @@ def main():
     train_loss = 0
     training_acc = 0
     training_count = 0
-    best_wer = float('inf')
-    all_metrics = []
+    if all_metrics:
+        best_wer = min([m['wer'] for m in all_metrics if m['dataset'] == dataset_for_choosing_checkpoint])
+    else:
+        best_wer = float('inf')
 
+    normalizer = EnglishSpellingNormalizer()
     for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1), disable=not accelerator.is_main_process):
         optimizer.zero_grad()
         if args.connector_eval:
@@ -428,7 +453,7 @@ def main():
                 accelerator.unwrap_model(model).text_encoder.eval()
             else:
                 accelerator.unwrap_model(model).text_encoder.train()
-        
+        train_asr_loader_iter = iter(train_asr_loader)
         ## ACCUMULATION STEPS
         for k in range(args.accumulation_steps):
             try:
@@ -478,10 +503,16 @@ def main():
                                     mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                                     mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
                                     loss_t += args.mse_weight*mse_loss
-                                
+                                if args.mse_loss_logit:
+                                    mse_loss = ((z_s - z_t[0:args.per_device_train_asr_batch_size, padded_len:,:])**2).to(device)
+                                    lengths = x_s_clone['input_len'].to(device)
+                                    mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
+                                    mse_loss = mse_loss*mask[:, :, None] #bxNxdims
+                                    mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
+                                    loss_t += args.mse_weight*mse_loss
                             else:
                                 z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
-
+                                loss_t = args.text_weight*loss_t
                             loss = loss_s + loss_t
                         else:
                             loss = loss_s
@@ -496,19 +527,26 @@ def main():
                             z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                             hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                             padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
-
+                            loss_t = args.text_weight*loss_t
                             if args.mse_loss:
                                 mse_loss = ((hidden_states_s - hidden_states_s_t[:,padded_len:,:])**2).to(device) #bxNxdims
                                 lengths = x_s_clone['input_len'].to(device)
                                 mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
                                 mse_loss = mse_loss*mask[:, :, None] #bxNxdims
                                 mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
-                                loss_t += mse_loss
+                                loss_t += args.mse_weight*mse_loss
+                            if args.mse_loss_logit:
+                                mse_loss = ((z_s - z_t[0:args.per_device_train_asr_batch_size, padded_len:,:])**2).to(device)
+                                lengths = x_s_clone['input_len'].to(device)
+                                mask = models_asr.lengths_to_mask(lengths).to(device) #bxdims
+                                mse_loss = mse_loss*mask[:, :, None] #bxNxdims
+                                mse_loss = mse_loss.sum() / (mask.sum() * hidden_states_s.shape[-1])
+                                loss_t += args.mse_weight*mse_loss
                             
                         else:
                             z_t, loss_t, acc_t = model(x_t, is_text = True, output_hidden_states=False)
-
-                        loss = loss_s + args.text_weight*loss_t
+                            loss_t = args.text_weight*loss_t
+                        loss = loss_s + loss_t
                     else:
                         loss = loss_s
                 
@@ -595,7 +633,9 @@ def main():
 
                         with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                             text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
+                            text_x = [normalizer(t) for t in text_x]
                         text_y = val_batch['text_trans']
+                        text_y = [normalizer(t) for t in text_y]
                         all_transcriptions += text_x
                         all_references += text_y
                     val_loss = val_loss / val_count
@@ -680,8 +720,9 @@ def main():
                     if args.train_encoder:
                         accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                     yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
-            recent_wer = [m['wer'] for m in all_metrics[-args.early_stopping_patience:]]
-            all_wers = [m['wer'] for m in all_metrics]
+            recent_wer = [m['wer'] for m in all_metrics[-args.early_stopping_patience:]
+                          if m["dataset"] == dataset_for_choosing_checkpoint]
+            all_wers = [m['wer'] for m in all_metrics if m["dataset"] == dataset_for_choosing_checkpoint]
 
         if j % args.save_steps == 0 and accelerator.is_main_process:
             accelerator.unwrap_model(model).connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))

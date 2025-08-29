@@ -22,6 +22,20 @@ def modify_commonvoice(item, normalizer=None):
     new_item["audio_len"] = len(new_item["audio"]["array"])
     return new_item
 
+def modify_voxpopuli(item, normalizer=None):
+    new_item = {}
+    new_item["text"] = item["normalized_text"]
+    #if ds_text_column == "normalized_text":
+    new_item["normalized_text"] = normalize_text(new_item["text"], normalizer=normalizer)
+    new_item["audio"] = item["audio"]
+    audio = item['audio']['array']
+    audio = torchaudio.transforms.Resample(orig_freq=item['audio']['sampling_rate'], new_freq=16000)(torch.tensor(audio, dtype=torch.float32))
+    new_item["audio"]["sampling_rate"] = 16_000
+    new_item["audio"]["array"] = audio.numpy()
+    new_item["audio_len"] = len(new_item["audio"]["array"])
+    return new_item
+
+
 def modify_librispeech(item, normalizer=None):
     new_item = {}
     new_item["text"] = item["text"]
@@ -106,6 +120,8 @@ def generate_dataset(shards, ds_type, normalizer=None):
                 item = modify_fisher(item, normalizer=normalizer)
             if ds_type.startswith("spokenwoz"):
                 item = modify_spokenwoz(item, normalizer=normalizer)
+            if ds_type == "voxpopuli":
+                item = modify_voxpopuli(item, normalizer=normalizer)
         
             yield {
                 "text": item["text"],            
@@ -132,7 +148,7 @@ def generate_text_ds(shards, ds_type, normalizer=None):
 def main():
     path = "/mnt/matylda6/ivendrame/wavlm_connector_lm/notebooks/test_datasets/"
     dataset_path = "/mnt/scratch/tmp/ivendrame/huggingface/modules/datasets_modules/datasets/"
-    splits = ["text_train"]
+    splits = ["validation"]
     num_proc = 20
     normalizer = EnglishSpellingNormalizer()
 
@@ -141,13 +157,14 @@ def main():
     for split in splits:
         for k,v in config_datasets[str(split)].items():
             ds_name = v["name"].split(":")[0] if ":" in v["name"] else v["name"]
+            print(ds_name)
             ds_subset = v["name"].split(":")[1] if ":" in v["name"] else None
-            ds_split = "train" #v["text_train"]
+            ds_split = v["split"] #v["text_validation"]
             ds_text_column = v["text_column"]
 
             if ds_name == "dialog_studio":
                 for ds in os.listdir(v["path"]):
-                    split = "train"
+                    split = ""
                     loaded_dataset = datasets.load_from_disk(os.path.join(v["path"],ds))
                     loaded_dataset= loaded_dataset[split]
                     shards = []
@@ -163,16 +180,17 @@ def main():
                         "text": datasets.Value("string"),
                         "normalized_text": datasets.Value("string"),
                         }), num_proc=num_proc)
-                    new_dataset.save_to_disk(os.path.join(dataset_path, f"prep_{k}_{split}_{ds}"), )
+                    new_dataset.save_to_disk(os.path.join(dataset_path, f"prep_{k}_text_train_{ds}"), )
             
-            elif ds_name == "open_subtitles":
-                loaded_dataset = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=4)
-                    
-                loaded_dataset = loaded_dataset[split]
+            elif k == "open_subtitles":
+                ds_split = "validation"
+                print(ds_name, ds_subset, ds_split)
+                loaded_dataset = datasets.load_dataset(ds_name, "all", split = ds_split, trust_remote_code=True, num_proc=4)
+                loaded_dataset = loaded_dataset
                 shards = []
-                print(f"shards {k} {split}")
+                print(f"shards {k} {ds_split}")
                 for i in range(1):
-                    shard_path = os.path.join(dataset_path, f"{k}_{split}_shard_{i}.json")
+                    shard_path = os.path.join(dataset_path, f"{k}_{ds_split}_shard_{i}.json")
                     shard = loaded_dataset.shard(num_shards=1, index=i)
                     shard.save_to_disk(shard_path)
                     shards.append(shard_path)
@@ -180,23 +198,26 @@ def main():
                 "text": datasets.Value("string"),
                 "normalized_text": datasets.Value("string"),
                 }), num_proc=num_proc)
-                new_dataset.save_to_disk(os.path.join(dataset_path, f"prep_{k}_{split}"), )
+                new_dataset.save_to_disk(os.path.join(dataset_path, f"prep_{k}_{ds_split}"), )
             
             else:
                 if "path" in v:
-                    loaded_dataset = datasets.load_from_disk(v['path'])
-                    loaded_dataset = loaded_dataset["train"]
+                    print("Loading from path", v['path'])
+                    loaded_dataset = datasets.load_from_disk(os.path.join(v['path']))
+
+                    #loaded_dataset = loaded_dataset[ds_split]
                 else:
+                    print("Loading from huggingface", ds_name, ds_subset, ds_split)
                     if ds_subset:
-                        loaded_dataset = datasets.load_dataset(ds_name, ds_subset, split = ds_split, trust_remote_code=True, num_proc=num_proc)
+                        loaded_dataset = datasets.load_dataset(ds_name, ds_subset, split = ds_split, trust_remote_code=True, num_proc=num_proc)#, download_mode='force_redownload' )#download_mode='force_redownload'
                     else:
-                        loaded_dataset = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=num_proc)
+                        loaded_dataset = datasets.load_dataset(ds_name, split = ds_split, trust_remote_code=True, num_proc=num_proc)#,download_mode='force_redownload') #  download_mode='force_redownload'
 
                 shards = []
                 print(f"shards {k} {split}")
                 for i in range(8):
                     shard_path = os.path.join(dataset_path, f"{k}_{split}_shard_{i}.json")
-                    shard = loaded_dataset.shard(num_shards=8, index=i)
+                    shard = loaded_dataset.shard(num_shards=10, index=i)
                     shard.save_to_disk(shard_path)
                     shards.append(shard_path)
                 
@@ -207,6 +228,7 @@ def main():
                     "audio": datasets.Audio(sampling_rate=16_000),
                     "audio_len": datasets.Value("int32")}), num_proc=num_proc)
                 new_dataset.save_to_disk(os.path.join(dataset_path, f"prep_{k}_{split}"), )
+                print("Saved dataset to", os.path.join(dataset_path, f"prep_{k}_{split}"))
 
 if __name__ == '__main__':
     main()
