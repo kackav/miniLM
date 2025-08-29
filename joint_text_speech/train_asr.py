@@ -18,6 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 import transformers
 import datasets
 import accelerate
+from peft import get_peft_model, LoraConfig, PeftModel
 from whisper_normalizer.english import EnglishSpellingNormalizer
 
 
@@ -154,11 +155,13 @@ def main():
                         help='lm name as string')
 
     parser.add_argument('--pretrained_dir', type=str, default=None,
-                        help='pretrained connector and encoder dir: takes models from /latest')
+                        help='pretrained connector and encoder dir: takes models from this dir')
     parser.add_argument('--train_encoder', action='store_true',
                         help='train encoder')
     parser.add_argument('--train_lm', action='store_true',
                         help='train lm')
+    parser.add_argument('--freeze_text_encoder', action='store_true',
+                        help='freeze text encoder')
     parser.add_argument('--text_input', action='store_true',
                         help='use text and audio input for training, if False use audio input')
     parser.add_argument('--train_with_asr_text', action='store_true',
@@ -188,6 +191,8 @@ def main():
                         help = 'number of connector layers')
     parser.add_argument('--text_encoder_layers', type = int, default = 2,
                         help = 'number of text encoder layers')
+    parser.add_argument('--lora_rank', type=int,
+                        help='rank of LoRA layers in connector model')
     parser.add_argument('--dataset_for_choosing_checkpoint',
                         help='validation dataset fo choosing the best checkpoint.'
                         'If unspecified, defaults to the validation dataset in the yaml')
@@ -223,8 +228,27 @@ def main():
     ## MODEL    
     lm_model_name = args.lm_model_name
     lm = transformers.AutoModelForCausalLM.from_pretrained(args.lm_model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2', device_map=accelerator.device, )
+    if args.lora_rank is not None:
+        lora_config = LoraConfig(
+            task_type='CAUSAL_LM',
+            target_modules='all-linear',
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+        )
+        if args.resume:
+            accelerator.print('Loading LoRA config from checkpoint')
+            lm = PeftModel.from_pretrained(lm, os.path.join(args.output_dir, 'latest', 'lm'))
+        elif args.pretrained_dir is not None and os.path.isfile(os.path.join(args.pretrained_dir, 'lm', 'adapter_config.json')):
+            accelerator.print(f'Loading LoRA config from {args.pretrained_dir}')
+            lm = PeftModel.from_pretrained(lm, os.path.join(args.pretrained_dir,'lm')) 
+        else:
+            accelerator.print(sum([_p.numel() for _p in lm.parameters() if _p.requires_grad]))
+            lm = get_peft_model(lm, lora_config)
+
+            accelerator.print(sum([_p.numel() for _p in lm.parameters() if _p.requires_grad]))
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
-    if args.use_bos_from_lm:
+    using_gemma = re.match(r'google/gemma.*', args.lm_model_name)
+    if args.use_bos_from_lm or using_gemma:
         bos_token = lm.config.bos_token_id
     else:
         if args.bos_token is None:
@@ -260,14 +284,18 @@ def main():
         
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
-        best_val_loss = min([m['val_loss'] for m in all_metrics])
+        best_wer = min([m['wer'] for m in all_metrics])
 
     elif args.pretrained_dir is not None:
         accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
-        connector = models_asr.Connector.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device)
+        connector = models_asr.Connector.load_from_dir(args.pretrained_dir, device)
         connector = connector.to(device)
-        encoder = models_asr.WavLMWrapper.load_from_dir(os.path.join(args.pretrained_dir, 'latest'), device, deactivate_masked_spec_embed = True)
-        if args.text_input:
+        encoder = models_asr.WavLMWrapper.load_from_dir(args.pretrained_dir, device, deactivate_masked_spec_embed = True)
+        
+        if os.path.isfile(os.path.join(args.pretrained_dir, 'TextEncoder_model.pt')):
+                accelerator.print(f'Loading pretrained text encoder from {args.pretrained_dir}')
+                text_encoder = models_asr.TextEncoder.load_from_dir(args.pretrained_dir, device)
+        else:
             if args.use_llm_emb:
                 text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size, num_layers = args.text_encoder_layers)
             else:
@@ -282,7 +310,8 @@ def main():
                 text_encoder = models_asr.TextEncoder(args.mask_rate, vocab_size=None, dim_input = args.text_encoder_dim, dim_output = encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, dim_lm_embeddings=lm.config.hidden_size, num_layers = args.text_encoder_layers)
             else:
                 text_encoder = models_asr.TextEncoder(args.mask_rate, tokenizer.vocab_size, args.text_encoder_dim, encoder.encoder.config.hidden_size, num_heads=4, ff_size = 4*(args.text_encoder_dim), pad_token=tokenizer.pad_token_id, num_layers = args.text_encoder_layers)
-
+            
+            
     if args.text_input:
         model = models_asr.EncoderConnectorLmWithPretrainedLm(encoder, connector, lm, tokenizer, text_encoder)
     else:
@@ -291,20 +320,26 @@ def main():
     
     if not args.train_encoder:
         model.freeze_encoder()
-    if not args.train_lm:
+    if not args.train_lm and args.lora_rank is None:
         model.freeze_lm()
 
     # parameters
     parameters_to_train = [{"params": model.connector.parameters(), "lr": args.peak_connector_lr, "weight_decay": args.weight_decay}]
     if args.train_encoder:
         parameters_to_train += [{"params": model.encoder.parameters(), "lr": args.peak_lr,"weight_decay": args.weight_decay}]
-    if args.text_input:
+    if args.text_input and not args.freeze_text_encoder:
         parameters_to_train += [{"params": model.text_encoder.parameters(), "lr": args.peak_text_encoder_lr,"weight_decay": args.weight_decay}]
     if args.train_lm:
         parameters_to_train += [{"params": model.lm.parameters(),"lr": args.peak_lm_lr,"weight_decay": args.weight_decay}]
-    
+    if args.lora_rank is not None:
+        #parameters_to_train += [p for p in model.lm.parameters() if p.requires_grad]
+        parameters_to_train += [{"params": [p for p in model.lm.parameters() if p.requires_grad], "lr": args.peak_lr,"weight_decay": args.weight_decay}]
 
     accelerator.print(model.config)
+    accelerator.print(model)
+    accelerator.print("Trainable parameters")
+    accelerator.print([_k for (_k, _p) in accelerator.unwrap_model(model).named_parameters() if _p.requires_grad])
+    
     accelerator.print(f'Number of total parameters: {sum(p.numel() for p in model.parameters())}')
     accelerator.print(f'Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
     batch_asr_size = n_gpus*args.per_device_train_asr_batch_size*args.accumulation_steps
@@ -584,7 +619,10 @@ def main():
                 writer.add_scalar("Accuracy/text_train", acc_t, j)
                 writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
                 writer.add_scalar("Data/Batch Text Size", batch_t['labels'].shape[0]*args.accumulation_steps*n_gpus, j)
-                writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[2]['lr'], j)
+                if not args.freeze_text_encoder:
+                    writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[2]['lr'], j)
+                else:
+                    writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
                 if args.train_with_asr_text:
                     # writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     # writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
@@ -705,6 +743,8 @@ def main():
                     accelerator.unwrap_model(model).text_encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
                 if args.train_encoder:
                     accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, 'latest'))
+                if args.lora_rank is not None:
+                    accelerator.unwrap_model(model).lm.save_pretrained(os.path.join(args.output_dir, 'latest', 'lm'))
                 yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'w'))
 
                 # save otpimizer state
@@ -719,6 +759,8 @@ def main():
                         accelerator.unwrap_model(model).text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
                     if args.train_encoder:
                         accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
+                    if args.lora_rank is not None:# or args.multi_outputs is not None:
+                        accelerator.unwrap_model(model).lm.save_pretrained(os.path.join(args.output_dir, 'best', 'lm'))
                     yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
             recent_wer = [m['wer'] for m in all_metrics[-args.early_stopping_patience:]
                           if m["dataset"] == dataset_for_choosing_checkpoint]
@@ -730,6 +772,8 @@ def main():
                 accelerator.unwrap_model(model).text_encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
             if args.train_encoder:
                 accelerator.unwrap_model(model).encoder.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
+            if args.lora_rank is not None:# or args.multi_outputs is not None:
+                accelerator.unwrap_model(model).lm.save_pretrained(os.path.join(args.output_dir, f'checkpoint_{j}', 'lm'))
             yaml.dump(all_metrics, open(os.path.join(args.output_dir, f'checkpoint_{j}', 'metrics.yaml'), 'w'))
             yaml.dump(lm_config, open(os.path.join(args.output_dir, 'lm_config.yaml'), 'w'))
             yaml.dump(datasets_config, open(os.path.join(args.output_dir, 'datasets_config.yaml'), 'w'))

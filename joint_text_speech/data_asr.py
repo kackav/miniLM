@@ -291,7 +291,7 @@ def collate_fn_text(batch, tokenizer=None):
     labels = [torch.tensor(_['labels'], dtype=torch.long) for _ in batch]
     # pad and concatenate input_ids and labels
     input_ids = torch.nn.utils.rnn.pad_sequence(
-        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id if tokenizer is not None else 0
+        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id if tokenizer is not None else 00
     )
     labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
 
