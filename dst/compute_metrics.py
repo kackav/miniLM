@@ -14,7 +14,7 @@ def compute_dst_training_metrics(refs, hyps):
     for i, hyp in enumerate(hyps):
         try:
             hyp = json_repair.loads(hyp)
-        except IndexError:
+        except:
             print(f"Error decoding JSON for hypothesis {i}")
             print(hyp)
         if not(isinstance(hyp, dict)):

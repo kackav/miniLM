@@ -686,6 +686,8 @@ def main():
                         "slot_v_tp": 0,
                         "slot_v_fp": 0,
                         "slot_v_fn": 0,
+                        "num_erroneous_turns": 0,
+                        "num_turns": 0,
                         # "ref_labels": [],
                         # "hyp_labels": [],
                         }
@@ -717,7 +719,8 @@ def main():
                     values = accelerator.reduce(values).tolist()
                     all_dst_metrics = {k: v for k, v in zip(keys, values)}
                     dst_summary_metrics = compute_metrics.compute_dst_precision_recall_f1(all_dst_metrics)
-
+                    jga = (all_dst_metrics["num_turns"] - all_dst_metrics["num_erroneous_turns"]) / all_dst_metrics["num_turns"] if all_dst_metrics["num_turns"] > 0 else 0.0
+                    dst_summary_metrics["jga"] = jga
 
                     #     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                     #         text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
