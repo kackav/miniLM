@@ -206,7 +206,7 @@ def main():
         pass
 
     accelerator = accelerate.Accelerator()
-    print("CUDA_VISIBLE_DEVICES:", os.environ.get('CUDA_VISIBLE_DEVICES', ''))
+
     _x = torch.tensor([1.0], device=accelerator.device, dtype=torch.bfloat16)
 
     # device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
@@ -488,7 +488,7 @@ def main():
                 accelerator.unwrap_model(model).text_encoder.eval()
             else:
                 accelerator.unwrap_model(model).text_encoder.train()
-        train_asr_loader_iter = iter(train_asr_loader)
+                
         ## ACCUMULATION STEPS
         for k in range(args.accumulation_steps):
             try:
@@ -620,11 +620,12 @@ def main():
                 writer.add_scalar("Data/Text (TextEncoder) Length", batch_t['input_len'].float().mean().item(), j)
                 writer.add_scalar("Data/Batch Text Size", batch_t['labels'].shape[0]*args.accumulation_steps*n_gpus, j)
                 if not args.freeze_text_encoder:
-                    writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[2]['lr'], j)
-                else:
-                    writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
+                    if args.train_encoder:
+                        writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[2]['lr'], j)
+                    else:
+                        writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
                 if args.train_with_asr_text:
-                    # writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
+                    # writer.add_scalar("Loss/textS_asr_train", loss_s_t, j)
                     # writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
                     if args.mse_loss:
                         writer.add_scalar("Loss/mse_loss", mse_loss, j)
