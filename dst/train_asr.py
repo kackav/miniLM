@@ -11,18 +11,21 @@ import re
 
 import data_asr
 import models_asr
-from safe_gpu import safe_gpu
+#from safe_gpu import safe_gpu
 
 import jiwer
+import compute_metrics
 from torch.utils.tensorboard import SummaryWriter
 import transformers
 import datasets
 import accelerate
 from peft import get_peft_model, LoraConfig, PeftModel
-from whisper_normalizer.english import EnglishSpellingNormalizer
+#from whisper_normalizer.english import EnglishSpellingNormalizer
 
-
+# torch._dynamo.config.disable = True
+# torch.backends.cudnn.benchmark = False
 #print environment variables
+#torch.autograd.set_detect_anomaly(True)
 print("HF datasets cache", os.environ.get('HF_DATASETS_CACHE', ''))
 print("hf home", os.environ.get('HF_HOME', ''))
 hf_dataset_path = os.environ.get('HF_HOME', '')+ '/modules/datasets_modules/datasets'
@@ -197,7 +200,6 @@ def main():
                         help='validation dataset fo choosing the best checkpoint.'
                         'If unspecified, defaults to the validation dataset in the yaml')
     parser.add_argument('--mse_loss_logit', action='store_true', help = 'trai with mse loss calculated on logits')
-
     args = parser.parse_args()
     #torch.set_default_dtype(torch.bfloat16)
     torch.set_float32_matmul_precision('high')
@@ -206,7 +208,7 @@ def main():
         pass
 
     accelerator = accelerate.Accelerator()
-
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get('CUDA_VISIBLE_DEVICES', ''))
     _x = torch.tensor([1.0], device=accelerator.device, dtype=torch.bfloat16)
 
     # device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
@@ -247,8 +249,7 @@ def main():
 
             accelerator.print(sum([_p.numel() for _p in lm.parameters() if _p.requires_grad]))
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm_model_name, trust_remote_code=True)
-    using_gemma = re.match(r'google/gemma.*', args.lm_model_name)
-    if args.use_bos_from_lm or using_gemma:
+    if hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None:  # args.use_bos_from_lm:
         bos_token = lm.config.bos_token_id
     else:
         if args.bos_token is None:
@@ -261,7 +262,7 @@ def main():
                 "bos_token": bos_token}
     accelerator.print("lm_config", lm_config)
 
-    best_wer = float('inf')
+    best_slot_k_f1 = 0
     all_metrics = []
     if args.resume:
         accelerator.print('Resuming from checkpoint')
@@ -284,7 +285,7 @@ def main():
         
         with open(os.path.join(args.output_dir, 'latest', 'metrics.yaml'), 'r') as f:
             all_metrics = yaml.safe_load(f)
-        best_wer = min([m['wer'] for m in all_metrics])
+        best_slot_k_f1 = max([m['slot_k_f1'] for m in all_metrics])
 
     elif args.pretrained_dir is not None:
         accelerator.print(f'Loading pretrained connector and encoder from {args.pretrained_dir}')
@@ -350,20 +351,24 @@ def main():
     ## DATASETS
     # validation (dict of datasets)
     datasets_config = yaml.load(open(args.datasets_config), Loader=yaml.FullLoader)
-    dset_valid = data_asr.load_from_config('validation', datasets_config, hf_dataset_path) # dictonary ["commonvoice": ..., "librispeech": ... etc]
+    dset_valid = data_asr.load_dial_from_config('validation', datasets_config, hf_dataset_path, tokenizer,
+                                                accelerator=accelerator) # dictonary ["commonvoice": ..., "librispeech": ... etc]
     val_subsets = {}
     for k, v in dset_valid.items():
-        val_subsets[k] = data_asr.AudioDatasetHF({k:v}, tokenizer, bos_token)
+        val_subsets[k] = data_asr.DialogDatasetHF({k:v}, tokenizer, bos_token)
     if args.dataset_for_choosing_checkpoint is None:
         dataset_for_choosing_checkpoint = list(val_subsets.keys())[-1]
     else:
         dataset_for_choosing_checkpoint = args.dataset_for_choosing_checkpoint
     # train dataset
-    dset_train_s = data_asr.load_from_config('train', datasets_config, hf_dataset_path)
-    train_asr_data = data_asr.AudioDatasetHF(dset_train_s, tokenizer, bos_token)
+    dset_train_s = data_asr.load_dial_from_config('train', datasets_config, hf_dataset_path, tokenizer,
+                                                  accelerator=accelerator)
+    train_asr_data = data_asr.DialogDatasetHF(dset_train_s, tokenizer, bos_token)
     if args.text_input:
-        dset_train_t = data_asr.load_from_config('text_train', datasets_config, hf_dataset_path)
-        train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
+        dset_train_t = data_asr.load_dial_from_config('text_train', datasets_config, hf_dataset_path, tokenizer,
+                                                      accelerator=accelerator)
+        # train_text_data = data_asr.TextDatasetHF(dset_train_t, tokenizer, bos_token)
+        train_text_data = data_asr.TextDialogDatasetHF(dset_train_t, tokenizer, bos_token)
 
     ## Optimizer, scheduler, data loaders
     if args.resume:
@@ -382,25 +387,34 @@ def main():
 
     torch.manual_seed(24)
     # training dataloader
-    collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
+    collate_fn_dialog = data_asr.CollateFnDialog(tokenizer)
+    #functools.partial(data_asr.collate_fn_dialog, tokenizer=tokenizer)
+    #collate_fn_asr = functools.partial(data_asr.collate_fn_asr, tokenizer=tokenizer)
     train_asr_loader = torch.utils.data.DataLoader(train_asr_data, batch_size=args.per_device_train_asr_batch_size,
-                                               collate_fn=collate_fn_asr,
+                                               collate_fn=collate_fn_dialog,
                                                shuffle=True,
                                                num_workers=args.dataloader_num_workers, prefetch_factor= 16, pin_memory= False)
                                           #     drop_last=True)
      
     if args.text_input:
-        collate_fn_text = functools.partial(data_asr.collate_fn_text, tokenizer=tokenizer)
+        #collate_fn_text = functools.partial(data_asr.collate_fn_dialog_text, tokenizer=tokenizer)
+        collate_fn_text = data_asr.CollateFnDialogText(tokenizer=tokenizer)#, max_len = args.max_len)
         train_text_loader = torch.utils.data.DataLoader(train_text_data, batch_size=args.per_device_train_text_batch_size,
                                                collate_fn=collate_fn_text,
                                                shuffle=True,
-                                               num_workers=args.dataloader_num_workers, prefetch_factor= 16, pin_memory= False)                                    
+                                               num_workers=args.dataloader_num_workers, prefetch_factor=4, pin_memory= False)                                    
+    
+    # breakpoint()
+    # #batch_test = next(iter(inference_loader))
+    # batch_test = [inference_ds[0], inference_ds[1]]
+    # out_batch, pointers = collate_fn_dialog_inference(batch_test)
+    # print(out_batch)
     # validation dataloaders    
     validation_loaders = {}
     for name, ds in val_subsets.items():
         validation_loader = torch.utils.data.DataLoader(ds, batch_size=args.per_device_eval_batch_size,
-                                                    collate_fn=collate_fn_asr,
-                                                    num_workers=args.dataloader_num_workers_val, prefetch_factor= 8, pin_memory= False)
+                                                    collate_fn=collate_fn_dialog,
+                                                    num_workers=args.dataloader_num_workers_val, prefetch_factor=4, pin_memory= False)
         validation_loaders[name] = validation_loader
 
     # accelerator preparation
@@ -464,11 +478,11 @@ def main():
     training_acc = 0
     training_count = 0
     if all_metrics:
-        best_wer = min([m['wer'] for m in all_metrics if m['dataset'] == dataset_for_choosing_checkpoint])
+        best_slot_k_f1 = max([m['slot_k_f1'] for m in all_metrics if m['dataset'] == dataset_for_choosing_checkpoint])
     else:
-        best_wer = float('inf')
+        best_slot_k_f1 = 0
 
-    normalizer = EnglishSpellingNormalizer()
+    #normalizer = EnglishSpellingNormalizer()
     for j in tqdm.tqdm(range(start_step+1, args.max_steps + 1), disable=not accelerator.is_main_process):
         optimizer.zero_grad()
         if args.connector_eval:
@@ -488,7 +502,7 @@ def main():
                 accelerator.unwrap_model(model).text_encoder.eval()
             else:
                 accelerator.unwrap_model(model).text_encoder.train()
-                
+
         ## ACCUMULATION STEPS
         for k in range(args.accumulation_steps):
             try:
@@ -518,14 +532,18 @@ def main():
                         batch_t[key] = batch_t[key].to(device)
                 x_t = batch_t
                 y_t = batch_t['labels'].to(device)
-
+            #import pdb; breakpoint()
+            # inference_ds = data_asr.InferenceDialogDatasetHF(train_asr_data)
+            # batch_test = next(inference_ds)          
+            # collate_fn_inf = data_asr.collate_fn_dialog_inference(batch_test, collate_fn_dialog, tokenizer=tokenizer)
+            # print(collate_fn_inf)
             if k < args.accumulation_steps - 1:
                 with model.no_sync():
                     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
                         z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                         if args.text_input:
                             if args.train_with_asr_text:
-                                x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
+                                x_all_t = data_asr.collate_all_dialog_text(x_s_clone, x_t, tokenizer = tokenizer)
                                 z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                                 hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                                 padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
@@ -558,11 +576,12 @@ def main():
                     z_s, loss_s, acc_s, hidden_states_s = model(x_s, is_text = False, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                     if args.text_input:
                         if args.train_with_asr_text:
-                            x_all_t = data_asr.collate_all_text(x_s_clone, x_t, tokenizer = tokenizer)
+                            x_all_t = data_asr.collate_all_dialog_text(x_s_clone, x_t, tokenizer = tokenizer)
                             z_t, loss_t, acc_t, hidden_states_all_t = model(x_all_t, is_text = True, output_hidden_states=True, last_layer_MSE = args.last_layer_mse)
                             hidden_states_s_t = hidden_states_all_t[0:args.per_device_train_asr_batch_size]
                             padded_len = x_all_t['labels'].shape[1]- x_s_clone['labels'].shape[1]
-                            loss_t = args.text_weight*loss_t
+                            loss_t = args.text_weight * loss_t
+                            
                             if args.mse_loss:
                                 mse_loss = ((hidden_states_s - hidden_states_s_t[:,padded_len:,:])**2).to(device) #bxNxdims
                                 lengths = x_s_clone['input_len'].to(device)
@@ -586,6 +605,7 @@ def main():
                         loss = loss_s
                 
                 (loss/args.accumulation_steps).backward()
+                
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_value)
         optimizer.step()
         scheduler.step()
@@ -625,7 +645,7 @@ def main():
                     else:
                         writer.add_scalar("Learning Rate/Text Encoder", optimizer.param_groups[1]['lr'], j)
                 if args.train_with_asr_text:
-                    # writer.add_scalar("Loss/textS_asr_train", loss_s_t, j)
+                    # writer.add_scalar("Loss/text_asr_train", loss_s_t, j)
                     # writer.add_scalar("Accuracy/text_asr_train", acc_s_t, j)
                     if args.mse_loss:
                         writer.add_scalar("Loss/mse_loss", mse_loss, j)
@@ -656,8 +676,23 @@ def main():
                     val_count = 0
                     all_transcriptions = []
                     all_references = []
+                    all_dst_metrics = {
+                        "domain_tp": 0,
+                        "domain_fp": 0,
+                        "domain_fn": 0,
+                        "slot_k_tp": 0,
+                        "slot_k_fp": 0,
+                        "slot_k_fn": 0,
+                        "slot_v_tp": 0,
+                        "slot_v_fp": 0,
+                        "slot_v_fn": 0,
+                        # "ref_labels": [],
+                        # "hyp_labels": [],
+                        }
 
-                    for val_batch in tqdm.tqdm(val_dataset_loader, disable=not accelerator.is_main_process):
+                    for f, val_batch in enumerate(tqdm.tqdm(val_dataset_loader, disable=not accelerator.is_main_process)):
+                        # if f >= 10:
+                        #      break
                         val_x = val_batch
                         for key, value in val_x.items():
                             if isinstance(value, torch.Tensor):
@@ -669,14 +704,26 @@ def main():
                         val_loss += accelerator.gather(loss).mean().item()
                         val_acc += accelerator.gather(acc).mean().item()
                         val_count += 1
+                        ref = val_batch["text_trans"]
+                        hyp = z.argmax(dim=-1)
+                        hyp = [h[:l] for l, h in zip(val_x["input_len"], hyp)]
+                        hyp = [tokenizer.decode(h, skip_special_tokens=True) for h in hyp]
+                        batch_metrics = compute_metrics.compute_dst_training_metrics(ref, hyp)
+                        all_transcriptions += batch_metrics["hyp_labels"]
+                        all_references += batch_metrics["ref_labels"]
+                        all_dst_metrics = {k: all_dst_metrics[k] + batch_metrics[k] for k in all_dst_metrics.keys()}
+                    keys = all_dst_metrics.keys()
+                    values = torch.tensor(list(all_dst_metrics.values()), device=device)
+                    values = accelerator.reduce(values).tolist()
+                    all_dst_metrics = {k: v for k, v in zip(keys, values)}
+                    dst_summary_metrics = compute_metrics.compute_dst_precision_recall_f1(all_dst_metrics)
 
-                        with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
-                            text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
-                            text_x = [normalizer(t) for t in text_x]
-                        text_y = val_batch['text_trans']
-                        text_y = [normalizer(t) for t in text_y]
-                        all_transcriptions += text_x
-                        all_references += text_y
+
+                    #     with torch.autocast(enabled = True, device_type = "cuda", dtype= torch.bfloat16):
+                    #         text_x = accelerator.unwrap_model(model).generate(val_x, 100, bos_token = bos_token)
+                    #     text_y = val_batch['text_trans']
+                    #     all_transcriptions += text_x
+                    #     all_references += text_y
                     val_loss = val_loss / val_count
                     val_acc = val_acc / val_count    
                     output_wer = jiwer.process_words(all_references, all_transcriptions)
@@ -701,7 +748,7 @@ def main():
                     # Log validation metrics
                     if accelerator.is_main_process:
                         accelerator.print(ds_name)
-                        accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
+                        # accelerator.print(f'WER: {wer}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}')
                     
                         full_trt = [[r, t_] for r, t_ in zip(all_references, all_transcriptions)]
                         #full_trt = sorted(full_trt, key=lambda x: x[0])
@@ -716,10 +763,12 @@ def main():
                         writer.add_scalar(f"Loss/validation_{ds_name}", val_loss, j)                     
                         writer.add_scalar(f"Accuracy/validation_{ds_name}", val_acc, j)
                         writer.add_scalar(f"WER/wer_{ds_name}", wer, j)
-                        writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
-                        writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
-                        writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
-                        writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
+                        # writer.add_scalar(f"WER/insertions_{ds_name}", insertions, j)
+                        # writer.add_scalar(f"WER/deletions_{ds_name}", deletions, j)
+                        # writer.add_scalar(f"WER/substitutions_{ds_name}", substitutions, j)
+                        # writer.add_scalar(f"WER/cer_{ds_name}", cer, j)
+                        for k, v in dst_summary_metrics.items():
+                            writer.add_scalar(f"DST/{ds_name}_{k}", v, j)
                         logging_dict = {
                             'step': j,
                             'dataset' : ds_name,
@@ -730,8 +779,9 @@ def main():
                             'wer' : wer,
                             'learning_rate' : optimizer.param_groups[0]['lr'],
                             'batch_asr' : batch_asr_size,
-                            'batch_text' : batch_text_size
+                            'batch_text' : batch_text_size,
                             }
+                        logging_dict.update(dst_summary_metrics)
                         all_metrics.append(logging_dict)
                         accelerator.print(logging_dict)
             train_loss = 0
@@ -752,9 +802,9 @@ def main():
                 torch.save(optimizer.state_dict(), os.path.join(args.output_dir, 'latest', 'optimizer.pt'))
                 # save scheduler state
                 torch.save(scheduler.state_dict(), os.path.join(args.output_dir, 'latest', 'scheduler.pt'))
-
-                if wer < best_wer:
-                    best_wer = wer
+                slot_k_f1 = dst_summary_metrics["slot_k_f1"]
+                if slot_k_f1 > best_slot_k_f1:
+                    best_slot_k_f1 = slot_k_f1
                     accelerator.unwrap_model(model).connector.save_to_directory(os.path.join(args.output_dir, 'best'))
                     if args.text_input:
                         accelerator.unwrap_model(model).text_encoder.save_to_directory(os.path.join(args.output_dir, 'best'))
@@ -763,9 +813,9 @@ def main():
                     if args.lora_rank is not None:# or args.multi_outputs is not None:
                         accelerator.unwrap_model(model).lm.save_pretrained(os.path.join(args.output_dir, 'best', 'lm'))
                     yaml.dump(all_metrics, open(os.path.join(args.output_dir, 'best', 'metrics.yaml'), 'w'))
-            recent_wer = [m['wer'] for m in all_metrics[-args.early_stopping_patience:]
+            recent_slot_k_f1 = [m['slot_k_f1'] for m in all_metrics[-args.early_stopping_patience:]
                           if m["dataset"] == dataset_for_choosing_checkpoint]
-            all_wers = [m['wer'] for m in all_metrics if m["dataset"] == dataset_for_choosing_checkpoint]
+            all_slot_k_f1 = [m['slot_k_f1'] for m in all_metrics if m["dataset"] == dataset_for_choosing_checkpoint]
 
         if j % args.save_steps == 0 and accelerator.is_main_process:
             accelerator.unwrap_model(model).connector.save_to_directory(os.path.join(args.output_dir, f'checkpoint_{j}'))
@@ -784,7 +834,7 @@ def main():
             writer.flush()
         
         if j > 0 and j % args.validation_steps == 0:
-            if len(all_wers) > args.early_stopping_patience and all(v > min(all_wers) for v in recent_wer):
+            if len(all_slot_k_f1) > args.early_stopping_patience and all(v < max(all_slot_k_f1) for v in recent_slot_k_f1):
                 accelerator.print('Early stopping')
                 break
             
